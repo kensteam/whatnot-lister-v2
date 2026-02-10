@@ -2,177 +2,152 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // ---- REQUIRED BINDINGS ----
-    // env.R2 -> R2 bucket binding name MUST be "R2"
-    // env.PUBLIC_BASE_URL -> Worker variable (string), your r2.dev base url
-    if (!env.R2) return new Response("Missing R2 binding named 'R2'.", { status: 500 });
-    if (!env.PUBLIC_BASE_URL) return new Response("Missing Worker variable PUBLIC_BASE_URL.", { status: 500 });
-
-    // ---- UI ----
+    // --- ROUTES ---
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(htmlPage(), {
-        headers: { "content-type": "text/html; charset=UTF-8" },
-      });
+      return new Response(htmlPage(), { headers: { "content-type": "text/html; charset=UTF-8" } });
     }
 
-    // ---- UPLOAD ----
-    // POST /upload
+    // Upload images from phone -> R2
     if (request.method === "POST" && url.pathname === "/upload") {
+      assertEnv(env);
+
       const form = await request.formData();
+      const folder = (form.get("folder") || "").toString().trim();
+      const baseId = (form.get("baseId") || "").toString().trim();
 
-      const mediaType = String(form.get("media_type") || "").trim();
-      const itemId = String(form.get("item_id") || "").trim();
+      const allowedFolders = new Set(["vinyl_lp", "vinyl_45", "cd", "cassette"]);
+      if (!allowedFolders.has(folder)) return new Response("Bad folder.", { status: 400 });
+      if (!/^\d+$/.test(baseId)) return new Response("baseId must be digits (ex: 5000).", { status: 400 });
 
-      if (!/^(vinyl_lp|vinyl_45|cd|cassette)$/.test(mediaType)) {
-        return new Response("Bad media_type. Use vinyl_lp, vinyl_45, cd, cassette.", { status: 400 });
-      }
-      if (!/^\d{4,}$/.test(itemId)) {
-        return new Response("Bad item_id. Use 4+ digits like 5000, 5001, 7000.", { status: 400 });
-      }
+      const files = form.getAll("files");
+      if (!files.length) return new Response("No files selected.", { status: 400 });
 
-      // Grab all file fields named "photos"
-      const files = form.getAll("photos").filter(Boolean);
-      if (!files.length) return new Response("No files uploaded.", { status: 400 });
-
-      // Limit 2–8 like you want (still allow 1 if you insist, but enforce max)
-      if (files.length > 8) return new Response("Too many photos. Max 8.", { status: 400 });
-
-      const saved = [];
-
+      // Store as folder/baseId_1.jpg, baseId_2.jpg, ...
       let seq = 1;
-      for (const f of files) {
-        // f is a File
-        const name = (f && f.name) ? f.name : "";
-        const ext = safeExt(name) || guessExtFromType(f.type) || "jpg";
-        const key = `${mediaType}/${itemId}_${seq}.${ext}`;
+      const savedKeys = [];
 
-        const arrayBuf = await f.arrayBuffer();
-        await env.R2.put(key, arrayBuf, {
-          httpMetadata: { contentType: f.type || contentTypeForExt(ext) },
+      for (const f of files) {
+        if (!(f instanceof File)) continue;
+
+        // IMPORTANT: We are not converting HEIC here.
+        // Keep phone camera set to JPG if possible.
+        const ct = (f.type || "").toLowerCase();
+        if (!ct.includes("jpeg") && !ct.includes("jpg") && !ct.includes("png") && !ct.includes("webp")) {
+          return new Response(`Unsupported file type: ${f.type}. Use JPG/PNG/WebP.`, { status: 400 });
+        }
+
+        const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
+        const key = `${folder}/${baseId}_${seq}.${ext}`;
+        const buf = await f.arrayBuffer();
+
+        await env.R2.put(key, buf, {
+          httpMetadata: { contentType: f.type || "image/jpeg" },
         });
 
-        saved.push(key);
-        seq++;
+        savedKeys.push(key);
+        seq += 1;
       }
 
       return new Response(
-        JSON.stringify({ ok: true, saved, public: saved.map(k => joinUrl(env.PUBLIC_BASE_URL, k)) }, null, 2),
-        { headers: { "content-type": "application/json; charset=UTF-8" } }
+        `Uploaded:\n${savedKeys.join("\n")}\n\nNow hit Process.`,
+        { headers: { "content-type": "text/plain; charset=UTF-8" } }
       );
     }
 
-    // ---- PROCESS -> CSV DOWNLOAD ----
-    // POST /process
+    // Process -> CSV download
     if (request.method === "POST" && url.pathname === "/process") {
+      assertEnv(env);
+
       const TYPE_RULES = {
-        vinyl_lp: { category: "Music", subcategory: "Vinyl Records", price: 5, shipping: "1 lb" },
-        vinyl_45: { category: "Music", subcategory: "Vinyl Records", price: 3, shipping: "4-7 oz" },
-        cd:       { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz" },
-        cassette: { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz" },
+        vinyl_lp: { category: "Music", subcategory: "Vinyl Records", price: 5, shipping: "1 lb", label: "LP vinyl record" },
+        vinyl_45: { category: "Music", subcategory: "Vinyl Records", price: 3, shipping: "4-7 oz", label: "45 rpm vinyl record" },
+        cd:       { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "CD" },
+        cassette: { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "Music Cassette tape" },
       };
 
       const DEFAULTS = {
         quantity: 1,
-        saleType: "Auction",
+        type: "Auction",
         offerable: "TRUE",
         hazmat: "Not Hazmat",
         condition: "", // you fill later
         costPerItem: "",
       };
 
-      // List all objects in R2
-      const allKeys = [];
-      let cursor = undefined;
-      do {
-        const res = await env.R2.list({ cursor });
-        cursor = res.truncated ? res.cursor : undefined;
-        for (const obj of res.objects) allKeys.push(obj.key);
-      } while (cursor);
+      // List objects in R2
+      const imgKeys = await listImageKeys(env.R2);
 
-      // Accept jpg/jpeg/png/webp/heic
-      const imgKeys = allKeys.filter((k) =>
-        /\.(jpe?g|png|webp|heic)$/i.test(k) && /\/\d+_\d+\./.test(k)
-      );
-
-      // Group by folder + baseId (type + item number)
+      // Group by folder + baseId (folder/baseId_seq.ext)
       const items = new Map();
 
       for (const key of imgKeys) {
         const [folder, file] = key.split("/", 2);
-        if (!folder || !file) continue;
+        if (!TYPE_RULES[folder]) continue;
 
-        const m = file.match(/^(\d+)_([0-9]+)\.(.+)$/);
+        const m = file.match(/^(\d+)_([0-9]+)\.(jpe?g|png|webp)$/i);
         if (!m) continue;
 
         const baseId = m[1];
         const seq = Number(m[2]);
-
-        const type = TYPE_RULES[folder];
-        if (!type) continue;
 
         const itemKey = `${folder}:${baseId}`;
         if (!items.has(itemKey)) items.set(itemKey, { folder, baseId, images: [] });
         items.get(itemKey).images.push({ key, seq });
       }
 
-      const rows = [];
-      const sorted = Array.from(items.values())
-        .sort((a, b) => (a.baseId.localeCompare(b.baseId) || a.folder.localeCompare(b.folder)));
+      const sortedItems = Array.from(items.values()).sort((a, b) =>
+        a.baseId.localeCompare(b.baseId) || a.folder.localeCompare(b.folder)
+      );
 
-      for (const item of sorted) {
+      // Build rows
+      const rows = [];
+      const processedKeys = [];
+
+      for (const item of sortedItems) {
         item.images.sort((a, b) => a.seq - b.seq);
 
-        const type = TYPE_RULES[item.folder];
+        const rule = TYPE_RULES[item.folder];
+        const imageUrls = item.images.slice(0, 8).map(x => joinUrl(env.PUBLIC_BASE_URL, x.key));
 
-        // Temporary safe title (you can replace later once AI reading is added)
-        const title = makeSafeTitle(item.folder, item.baseId);
+        // AI reads the first image (front/cover)
+        const ai = await readMusicFromImage(env, imageUrls[0]);
 
-        const description = "See photos. Ships fast.";
+        // Title rules: <50 chars, no emojis
+        const title = clamp50(noEmoji(`${ai.artist} ${ai.title} ${rule.label}`.trim()));
 
-        const imageUrls = item.images
-          .slice(0, 8)
-          .map((x) => joinUrl(env.PUBLIC_BASE_URL, x.key));
+        // Basic description (safe + fast)
+        const description = clampDesc(`${ai.artist} - ${ai.title}. See photos. Ships fast.`);
 
         rows.push({
-          "Category": type.category,
-          "Sub Category": type.subcategory,
-          "Title": title,
-          "Description": description,
-          "Quantity": DEFAULTS.quantity,
-          "Type": DEFAULTS.saleType,
-          "Price": type.price,
-          "Shipping Profile": type.shipping,
-          "Offerable": DEFAULTS.offerable,
-          "Hazmat": DEFAULTS.hazmat,
-          "Condition": DEFAULTS.condition,
+          Category: rule.category,
+          "Sub Category": rule.subcategory,
+          Title: title || clamp50(noEmoji(`${rule.label} ${item.baseId}`)),
+          Description: description,
+          Quantity: DEFAULTS.quantity,
+          Type: DEFAULTS.type,
+          Price: rule.price,
+          "Shipping Profile": rule.shipping,
+          Offerable: DEFAULTS.offerable,
+          Hazmat: DEFAULTS.hazmat,
+          Condition: DEFAULTS.condition,
           "Cost Per Item": DEFAULTS.costPerItem,
-          "SKU": `${item.baseId}`,
+          SKU: `${item.baseId}`,
           ...toImageCols(imageUrls),
         });
+
+        // remember keys for cleanup
+        for (const img of item.images) processedKeys.push(img.key);
       }
 
+      // Save processed manifest for cleanup
+      await env.R2.put("_processed/last.json", JSON.stringify({ keys: processedKeys }), {
+        httpMetadata: { contentType: "application/json" },
+      });
+
       const headers = [
-        "Category",
-        "Sub Category",
-        "Title",
-        "Description",
-        "Quantity",
-        "Type",
-        "Price",
-        "Shipping Profile",
-        "Offerable",
-        "Hazmat",
-        "Condition",
-        "Cost Per Item",
-        "SKU",
-        "Image URL 1",
-        "Image URL 2",
-        "Image URL 3",
-        "Image URL 4",
-        "Image URL 5",
-        "Image URL 6",
-        "Image URL 7",
-        "Image URL 8",
+        "Category","Sub Category","Title","Description","Quantity","Type","Price",
+        "Shipping Profile","Offerable","Hazmat","Condition","Cost Per Item","SKU",
+        "Image URL 1","Image URL 2","Image URL 3","Image URL 4","Image URL 5","Image URL 6","Image URL 7","Image URL 8"
       ];
 
       const csv = toCsv(headers, rows);
@@ -185,10 +160,28 @@ export default {
       });
     }
 
+    // Cleanup after you upload CSV to Whatnot
+    if (request.method === "POST" && url.pathname === "/cleanup") {
+      assertEnv(env);
+
+      const obj = await env.R2.get("_processed/last.json");
+      if (!obj) return new Response("No last.json found. Run Process first.", { status: 400 });
+
+      const data = JSON.parse(await obj.text());
+      const keys = Array.isArray(data.keys) ? data.keys : [];
+
+      for (const k of keys) await env.R2.delete(k);
+
+      return new Response(`Deleted ${keys.length} images.`, {
+        headers: { "content-type": "text/plain; charset=UTF-8" },
+      });
+    }
+
     return new Response("Not found", { status: 404 });
   },
 };
 
+// --- HTML UI ---
 function htmlPage() {
   return `<!doctype html>
 <html>
@@ -198,16 +191,14 @@ function htmlPage() {
   <title>Whatnot Lister v2</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#fff;}
-    .wrap{max-width:920px;margin:40px auto;padding:0 18px;}
-    h1{font-size:40px;margin:0 0 18px;}
-    .card{border:1px solid #e7e7e7;border-radius:16px;padding:18px;margin:14px 0;}
-    label{display:block;font-size:14px;color:#333;margin:10px 0 6px;}
-    input,select{width:100%;font-size:18px;padding:12px;border:1px solid #ddd;border-radius:12px;}
-    button{font-size:20px;padding:14px 18px;border-radius:14px;border:1px solid #ddd;background:#f4f4f4;cursor:pointer;margin-top:14px;width:100%}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    .note{margin-top:10px;color:#444;font-size:13px}
-    .small{font-size:12px;color:#666;margin-top:6px}
-    code{background:#f6f6f6;padding:2px 6px;border-radius:8px}
+    .wrap{max-width:900px;margin:40px auto;padding:0 16px;}
+    h1{font-size:34px;margin:0 0 16px;}
+    .card{border:1px solid #e6e6e6;border-radius:14px;padding:14px;margin:12px 0;}
+    label{display:block;font-weight:600;margin:10px 0 6px;}
+    input,select{width:100%;padding:12px;border-radius:10px;border:1px solid #ccc;font-size:16px;}
+    button{font-size:18px;padding:14px 18px;border-radius:12px;border:1px solid #ddd;background:#f4f4f4;cursor:pointer}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+    .note{color:#444;font-size:13px;margin-top:8px}
   </style>
 </head>
 <body>
@@ -215,12 +206,12 @@ function htmlPage() {
     <h1>Whatnot Lister v2</h1>
 
     <div class="card">
-      <h2 style="margin:0 0 10px;font-size:22px;">1) Upload Photos</h2>
+      <h2>1) Upload Photos</h2>
       <form method="POST" action="/upload" enctype="multipart/form-data">
         <div class="row">
           <div>
-            <label>Type</label>
-            <select name="media_type" required>
+            <label>Folder</label>
+            <select name="folder" required>
               <option value="vinyl_lp">vinyl_lp (LP)</option>
               <option value="vinyl_45">vinyl_45 (45)</option>
               <option value="cd">cd</option>
@@ -228,40 +219,59 @@ function htmlPage() {
             </select>
           </div>
           <div>
-            <label>Item # (example: 5000)</label>
-            <input name="item_id" inputmode="numeric" pattern="\\d{4,}" placeholder="5000" required />
+            <label>Base ID (ex: 5000)</label>
+            <input name="baseId" inputmode="numeric" placeholder="5000" required />
           </div>
         </div>
 
-        <label>Photos (2–8)</label>
-        <input name="photos" type="file" accept="image/*" multiple required />
+        <label>Choose images (2–8 is ideal)</label>
+        <input type="file" name="files" accept="image/*" multiple required />
 
-        <button type="submit">Upload to R2</button>
-        <div class="small">Saves as: <code>type/item_1.ext</code>, <code>type/item_2.ext</code>...</div>
+        <div style="margin-top:12px;">
+          <button type="submit">Upload to R2</button>
+        </div>
+        <div class="note">Use JPG/PNG/WebP. (No HEIC conversion here.)</div>
       </form>
     </div>
 
     <div class="card">
-      <h2 style="margin:0 0 10px;font-size:22px;">2) Build CSV</h2>
+      <h2>2) Process → Download CSV</h2>
       <form method="POST" action="/process">
-        <button type="submit">Process Images → Download CSV</button>
+        <button type="submit">Process Images</button>
       </form>
-      <div class="note">CSV includes Category/Subcategory/Price/Shipping + up to 8 image URLs. Condition stays blank.</div>
+      <div class="note">This will download whatnot_upload.csv.</div>
     </div>
+
+    <div class="card">
+      <h2>3) Cleanup (after you upload CSV)</h2>
+      <form method="POST" action="/cleanup">
+        <button type="submit">Delete Processed Images</button>
+      </form>
+    </div>
+
   </div>
 </body>
 </html>`;
 }
 
-function makeSafeTitle(folder, baseId) {
-  const label =
-    folder === "vinyl_lp" ? "Vinyl LP" :
-    folder === "vinyl_45" ? "Vinyl 45" :
-    folder === "cd" ? "CD" :
-    folder === "cassette" ? "Cassette" :
-    "Item";
-  const t = `${label} ${baseId}`;
-  return t.length > 50 ? t.slice(0, 50) : t;
+// --- Helpers ---
+function assertEnv(env) {
+  if (!env.R2) throw new Error("Missing R2 binding named 'R2'.");
+  if (!env.PUBLIC_BASE_URL) throw new Error("Missing PUBLIC_BASE_URL variable.");
+  if (!env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY secret.");
+}
+
+async function listImageKeys(r2) {
+  const keys = [];
+  let cursor = undefined;
+  do {
+    const res = await r2.list({ cursor });
+    cursor = res.truncated ? res.cursor : undefined;
+    for (const obj of res.objects) {
+      if (/\.(jpe?g|png|webp)$/i.test(obj.key)) keys.push(obj.key);
+    }
+  } while (cursor);
+  return keys;
 }
 
 function joinUrl(base, key) {
@@ -276,6 +286,20 @@ function toImageCols(urls) {
   return out;
 }
 
+function noEmoji(s) {
+  return (s || "").replace(/[\p{Extended_Pictographic}]/gu, "").trim();
+}
+
+function clamp50(s) {
+  s = (s || "").trim();
+  return s.length > 50 ? s.slice(0, 50).trim() : s;
+}
+
+function clampDesc(s) {
+  s = (s || "").trim();
+  return s.length > 500 ? s.slice(0, 500).trim() : s;
+}
+
 function escCsv(v) {
   const s = (v === null || v === undefined) ? "" : String(v);
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
@@ -285,33 +309,60 @@ function escCsv(v) {
 function toCsv(headers, rows) {
   const lines = [];
   lines.push(headers.map(escCsv).join(","));
-  for (const r of rows) {
-    lines.push(headers.map((h) => escCsv(r[h] ?? "")).join(","));
-  }
+  for (const r of rows) lines.push(headers.map(h => escCsv(r[h] ?? "")).join(","));
   return lines.join("\n");
 }
 
-function safeExt(filename) {
-  const m = String(filename).toLowerCase().match(/\.([a-z0-9]+)$/);
-  if (!m) return "";
-  const ext = m[1];
-  if (["jpg","jpeg","png","webp","heic"].includes(ext)) return ext === "jpeg" ? "jpg" : ext;
-  return "";
-}
+// --- OpenAI vision (Responses API) ---
+async function readMusicFromImage(env, imageUrl) {
+  const model = env.OPENAI_MODEL || "gpt-5";
 
-function guessExtFromType(mime) {
-  const t = String(mime || "").toLowerCase();
-  if (t.includes("jpeg")) return "jpg";
-  if (t.includes("png")) return "png";
-  if (t.includes("webp")) return "webp";
-  if (t.includes("heic") || t.includes("heif")) return "heic";
-  return "";
-}
+  const prompt = `
+You are extracting listing basics from a photo of music media packaging.
+Return JSON only with keys: artist, title.
+Rules:
+- If unsure, best guess.
+- Keep artist/title short and clean (no emojis).
+`;
 
-function contentTypeForExt(ext) {
-  if (ext === "jpg") return "image/jpeg";
-  if (ext === "png") return "image/png";
-  if (ext === "webp") return "image/webp";
-  if (ext === "heic") return "image/heic";
-  return "application/octet-stream";
+  const body = {
+    model,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: prompt },
+          { type: "input_image", image_url: imageUrl }
+        ]
+      }
+    ]
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    // fallback
+    return { artist: "Unknown", title: "Unknown" };
+  }
+
+  const data = await resp.json();
+  const text = (data.output_text || "").trim();
+
+  try {
+    const j = JSON.parse(text);
+    return {
+      artist: (j.artist || "Unknown").toString().trim(),
+      title: (j.title || "Unknown").toString().trim(),
+    };
+  } catch {
+    // if model returns text, not json
+    return { artist: "Unknown", title: "Unknown" };
+  }
 }
