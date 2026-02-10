@@ -2,122 +2,124 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Simple UI
+    // UI
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(htmlPage(), {
         headers: { "content-type": "text/html; charset=UTF-8" },
       });
     }
 
-    // Button hits this endpoint
+    // Process button
     if (request.method === "POST" && url.pathname === "/process") {
-      if (!env.R2) {
-        return new Response("Missing R2 binding named 'R2'.", { status: 500 });
-      }
-      if (!env.PUBLIC_BASE_URL) {
-        return new Response("Missing PUBLIC_BASE_URL Worker variable.", { status: 500 });
-      }
+      if (!env.R2) return new Response("Missing R2 binding named 'R2'.", { status: 500 });
+      if (!env.PUBLIC_BASE_URL) return new Response("Missing PUBLIC_BASE_URL.", { status: 500 });
 
-      // ---- CONFIG (your locked rules) ----
-      // Price rules (you said this 10 times):
-      // LP = $5, CD/45/cassette = $3
-      const TYPE_RULES = {
-        vinyl_lp:   { category: "Music", subcategory: "Vinyl Records", price: 5, shipping: "1-2 lbs" },
-        vinyl_45:   { category: "Music", subcategory: "Vinyl Records", price: 3, shipping: "4-7 oz" },
-        cd:         { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz" },
-        cassette:   { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz" },
-      };
+      // OPTIONAL: limit scan to a folder/prefix like "Lister_Inbox/"
+      const INBOX_PREFIX = (env.INBOX_PREFIX || "").trim(); // ex: "Lister_Inbox/"
 
-      // Whatnot required-ish defaults
+      // Locked rules
       const DEFAULTS = {
         quantity: 1,
         saleType: "Buy It Now",
         offerable: "TRUE",
         hazmat: "Not Hazmat",
-        condition: "",        // YOU fill later
-        costPerItem: "",       // optional
+        condition: "",         // YOU fill later
+        costPerItem: "",        // optional
+        shippingProfile: "",    // YOU said you can pick it
       };
 
-      // ---- READ OBJECTS FROM R2 ----
-      // We accept keys like:
-      // vinyl_lp/5000_1.jpg
-      // cd/7000_3.jpg
-      // cassette/8000_2.jpg
+      // Determine media type by baseId range
+      function typeFromBaseId(baseIdNum) {
+        if (baseIdNum >= 5000 && baseIdNum <= 5999) {
+          return { category: "Music", subcategory: "Vinyl Records", price: 5, label: "LP" };
+        }
+        if (baseIdNum >= 8000 && baseIdNum <= 8999) {
+          return { category: "Music", subcategory: "Vinyl Records", price: 3, label: "45" };
+        }
+        if (baseIdNum >= 6000 && baseIdNum <= 6999) {
+          return { category: "Music", subcategory: "CDs & Cassettes", price: 3, label: "CD" };
+        }
+        if (baseIdNum >= 7000 && baseIdNum <= 7999) {
+          return { category: "Music", subcategory: "CDs & Cassettes", price: 3, label: "Cassette" };
+        }
+        return null;
+      }
+
+      // ---- READ OBJECTS FROM R2 (with optional prefix) ----
       const allKeys = [];
       let cursor = undefined;
+
       do {
-        const res = await env.R2.list({ cursor });
+        const res = await env.R2.list({
+          cursor,
+          prefix: INBOX_PREFIX || undefined,
+        });
         cursor = res.truncated ? res.cursor : undefined;
         for (const obj of res.objects) allKeys.push(obj.key);
       } while (cursor);
 
-      const imgKeys = allKeys.filter((k) =>
-        /\.(jpe?g|png|webp)$/i.test(k) && /\/\d+_\d+\./.test(k)
-      );
+      // Accept images anywhere, just needs filename like 5000_1.jpg
+      const imgKeys = allKeys.filter((k) => /\.(jpe?g|png|webp)$/i.test(k));
 
-      // Group into items by "####" (before underscore)
-      // and infer type by folder name (prefix before first '/')
+      // Group by baseId (5000) regardless of folder
       const items = new Map();
 
       for (const key of imgKeys) {
-        const [folder, file] = key.split("/", 2);
-        if (!folder || !file) continue;
-
-        const m = file.match(/^(\d+)_([0-9]+)\.(.+)$/);
+        const filename = key.split("/").pop() || "";
+        const m = filename.match(/^(\d{4})_([0-9]+)\.(jpe?g|png|webp)$/i);
         if (!m) continue;
 
-        const baseId = m[1];         // 5000
-        const seq = Number(m[2]);    // 1..n
+        const baseId = m[1];
+        const seq = Number(m[2]);
+        const baseIdNum = Number(baseId);
 
-        const type = TYPE_RULES[folder];
-        if (!type) continue; // ignore unknown folders
+        const type = typeFromBaseId(baseIdNum);
+        if (!type) continue; // ignore anything outside your numbering ranges
 
-        const itemKey = `${folder}:${baseId}`;
-        if (!items.has(itemKey)) {
-          items.set(itemKey, { folder, baseId, images: [] });
+        if (!items.has(baseId)) {
+          items.set(baseId, { baseId, baseIdNum, type, images: [] });
         }
-        items.get(itemKey).images.push({ key, seq });
+        items.get(baseId).images.push({ key, seq });
       }
 
-      // Sort items and images
       const rows = [];
-      const sorted = Array.from(items.values())
-        .sort((a, b) => (a.baseId.localeCompare(b.baseId) || a.folder.localeCompare(b.folder)));
+      const sorted = Array.from(items.values()).sort((a, b) => a.baseIdNum - b.baseIdNum);
 
       for (const item of sorted) {
         item.images.sort((a, b) => a.seq - b.seq);
 
-        const type = TYPE_RULES[item.folder];
+        // title placeholder (AI titles later)
+        const title = makeSafeTitle(item.type.label, item.baseId);
+        const description = "Condition shown live on stream."; // safe placeholder
 
-        // Title must be <50 chars, no emojis
-        // Keep it generic; you can edit later if you want.
-        const title = makeSafeTitle(item.folder, item.baseId);
-
-        const description = "See photos. Ships fast."; // safe placeholder
-
-        const imageUrls = item.images
-          .slice(0, 8) // Whatnot template shows multiple Image URL columns; we cap at 8
-          .map((x) => joinUrl(env.PUBLIC_BASE_URL, x.key));
+        const imageUrls = item.images.slice(0, 8).map((x) => joinUrl(env.PUBLIC_BASE_URL, x.key));
 
         rows.push({
-          Category: type.category,
-          "Sub Category": type.subcategory,
+          Category: item.type.category,
+          "Sub Category": item.type.subcategory,
           Title: title,
           Description: description,
           Quantity: DEFAULTS.quantity,
           Type: DEFAULTS.saleType,
-          Price: type.price,
-          "Shipping Profile": type.shipping,
+          Price: item.type.price,
+          "Shipping Profile": DEFAULTS.shippingProfile, // blank (you pick)
           Offerable: DEFAULTS.offerable,
           Hazmat: DEFAULTS.hazmat,
-          Condition: DEFAULTS.condition,
+          Condition: DEFAULTS.condition, // blank (you fill)
           "Cost Per Item": DEFAULTS.costPerItem,
-          SKU: `${item.baseId}`, // simple + stable
+          SKU: `${item.baseId}`, // stable
           ...toImageCols(imageUrls),
         });
       }
 
-      // ---- OUTPUT CSV (Whatnot template columns) ----
+      // If zero rows, return a loud message instead of an “empty file”
+      if (rows.length === 0) {
+        return new Response(
+          `No matching images found.\n\nExpected filenames like 5000_1.jpg, 6000_1.jpg, 7000_1.jpg, 8000_1.jpg\nOptional prefix scanned: "${INBOX_PREFIX || "(none)"}"\nTotal objects seen: ${allKeys.length}`,
+          { status: 400 }
+        );
+      }
+
       const headers = [
         "Category",
         "Sub Category",
@@ -184,14 +186,7 @@ function htmlPage() {
 </html>`;
 }
 
-function makeSafeTitle(folder, baseId) {
-  // under 50 chars, no emojis
-  const label =
-    folder === "vinyl_lp" ? "Vinyl LP" :
-    folder === "vinyl_45" ? "Vinyl 45" :
-    folder === "cd" ? "CD" :
-    folder === "cassette" ? "Cassette" :
-    "Item";
+function makeSafeTitle(label, baseId) {
   const t = `${label} ${baseId}`;
   return t.length > 50 ? t.slice(0, 50) : t;
 }
