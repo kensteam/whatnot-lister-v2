@@ -252,8 +252,13 @@ Best guess if unsure. No emojis. Keep short.
     },
     body: JSON.stringify(body),
   });
+console.log("OpenAI status:", resp.status);
 
-  if (!resp.ok) return { artist: "Unknown", title: "Unknown" };
+const raw = await resp.text();
+console.log("OpenAI raw response:", raw);
+
+// then parse it
+const data = JSON.parse(raw);  if (!resp.ok) return { artist: "Unknown", title: "Unknown" };
 
   const data = await resp.json();
   const text = (data.output_text || "").trim();
