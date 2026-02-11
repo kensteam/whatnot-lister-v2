@@ -50,7 +50,10 @@ export default {
         // AI pull (artist/title) from image 1
         const ai = await readMusicFromImage(env, imageUrls[0]);
 
-        const title = clamp50(noEmoji(`${ai.artist} ${ai.title} ${rule.label}`.trim())) || clamp50(noEmoji(`${rule.label} ${id}`));
+        const title =
+          clamp50(noEmoji(`${ai.artist} ${ai.title} ${rule.label}`.trim())) ||
+          clamp50(noEmoji(`${rule.label} ${id}`));
+
         const description = clampDesc(noEmoji(`${ai.artist} - ${ai.title}. See photos. Ships fast.`));
 
         rows.push({
@@ -72,9 +75,9 @@ export default {
       }
 
       const headers = [
-        "Category","Sub Category","Title","Description","Quantity","Type","Price","Shipping Profile",
-        "Offerable","Hazmat","Condition","Cost Per Item","SKU",
-        "Image URL 1","Image URL 2","Image URL 3","Image URL 4","Image URL 5","Image URL 6","Image URL 7","Image URL 8",
+        "Category", "Sub Category", "Title", "Description", "Quantity", "Type", "Price", "Shipping Profile",
+        "Offerable", "Hazmat", "Condition", "Cost Per Item", "SKU",
+        "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4", "Image URL 5", "Image URL 6", "Image URL 7", "Image URL 8",
       ];
 
       const csv = toCsv(headers, rows);
@@ -93,6 +96,9 @@ export default {
 
 function htmlPage(env) {
   const base = (env && env.IMAGE_BASE_URL) ? String(env.IMAGE_BASE_URL) : "";
+  const baseClean = base ? base.replace(/\/+$/, "") : "";
+  const example = baseClean ? `${baseClean}/vinyl_lp/5000_1.jpg` : "SET IMAGE_BASE_URL";
+
   return `<!doctype html>
 <html>
 <head>
@@ -118,8 +124,8 @@ function htmlPage(env) {
 
     <div class="card">
       <h2>1) Confirm server path</h2>
-      <div class="note">Worker reads directly from: <code>${escapeHtml(base)}</code></div>
-      <div class="note">Example: <code>${escapeHtml(base ? base.replace(/\\/+$/,"") : "")}/vinyl_lp/5000_1.jpg</code></div>
+      <div class="note">Worker reads directly from: <code>${escapeHtml(baseClean)}</code></div>
+      <div class="note">Example: <code>${escapeHtml(example)}</code></div>
     </div>
 
     <div class="card">
