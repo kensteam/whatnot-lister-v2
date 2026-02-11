@@ -1,18 +1,7 @@
 name = "whatnot-lister-v2"
 main = "worker.js"
 compatibility_date = "2025-02-01"
-workers_dev = true
 
-# ===== R2 BINDING =====
-[[r2_buckets]]
-binding = "R2"
-bucket_name = "media-assets"
-
-# ===== OBSERVABILITY (LOGS ONLY) =====
-[observability]
-enabled = false
-
-[observability.logs]
-enabled = true
-persist = true
-invocation_logs = true
+[vars]
+IMAGE_BASE_URL = "https://pub-7b33935cac0d41f3b1200955c2c5ecf5.r2.dev"
+OPENAI_MODEL = "gpt-4o-mini"
