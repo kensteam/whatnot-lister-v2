@@ -403,7 +403,7 @@ async function callOpenAIForListing(env, images, hints) {
   for (const imgUrl of images) {
     contentItems.push({
       type: "input_image",
-      image_url: { url: imgUrl },
+      image_url: imgUrl },
     });
   }
 
