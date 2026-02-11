@@ -195,31 +195,40 @@ function typeRules() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 function buildTitleDesc(ai, rule, id) {
-  const artist = ai.artist && ai.artist !== "Unknown" ? ai.artist : "";
-  const album  = ai.album  && ai.album  !== "Unknown" ? ai.album  : (ai.title || "");
+  const artist = safeStr(ai.artist);
+  const album  = safeStr(ai.album);
+  const label  = safeStr(ai.label);
+  const catNum = safeStr(ai.catalogNumber);
 
-  // Try AI-derived title first
+  // ── TITLE (deterministic, code-only — never trust model title) ──
   let title = "";
-  if (artist || album) {
-    title = clamp50(noEmoji(`${artist} ${album} ${rule.label}`.trim()));
+  if (artist && album) {
+    title = `${artist} - ${album} LP`;
+  } else if (artist) {
+    title = `${artist} Vinyl LP`;
+  } else {
+    title = `Vinyl LP Lot ${id}`;
   }
-  // Fallback: guaranteed non-blank
-  if (!title) {
-    title = clamp50(noEmoji(`${rule.label} Lot ${id}`));
+  title = clamp50(noEmoji(title));
+
+  // ── DESCRIPTION (deterministic template — never trust model description) ──
+  const lines = [];
+
+  if (artist && album) {
+    lines.push(`LP Vinyl Record: ${artist} - ${album}`);
+  } else {
+    lines.push("LP Vinyl Record (see photos)");
   }
 
-  // Description
-  const descParts = [];
-  if (ai.description) {
-    descParts.push(ai.description);
-  } else if (artist || album) {
-    descParts.push(`${artist} - ${album}.`.replace(/^\s*-\s*/, "").trim());
+  const labelCat = [label, catNum].filter(Boolean).join(" ").trim();
+  if (labelCat) {
+    lines.push(`Label/Cat#: ${labelCat}`);
   }
-  if (ai.label)         descParts.push(`Label: ${ai.label}.`);
-  if (ai.catalogNumber) descParts.push(`Cat#: ${ai.catalogNumber}.`);
-  descParts.push("See photos. Ships fast.");
 
-  const description = clampDesc(noEmoji(descParts.filter(Boolean).join(" ")));
+  lines.push("Condition unknown; see photos.");
+  lines.push("Ships fast & packed safely.");
+
+  const description = clampDesc(noEmoji(lines.join("\n")));
 
   return { title, description };
 }
@@ -384,26 +393,32 @@ async function callOpenAIForListing(env, images, hints) {
   const _debug = { status: null, error: null, rawPreview: null, parsedObject: null, requestBodyPreview: null };
 
   const systemPrompt = [
-    `You are a music media identification expert. You will be shown photos of a ${hints.label}.`,
-    `Respond with ONLY valid JSON — no markdown fences, no preamble, no trailing text.`,
-    `Schema: {"artist":"string","album":"string","title":"string (short listing title)",`,
-    `"description":"string (1-2 sentence selling description)",`,
-    `"label":"string or empty (record label if visible)",`,
-    `"catalogNumber":"string or empty","confidence":0.0-1.0}`,
-    `Best guess if unsure. No emojis. Keep artist/album short.`,
+    `You are identifying an ${hints.label} from photos for an auction listing.`,
+    `Return ONLY valid JSON (no markdown, no extra text).`,
+    `Rules:`,
+    `- If Artist + Album visible: identify both.`,
+    `- If unsure: use best guess and keep it short.`,
+    `- No emojis.`,
+    `- Keep everything concise and auction-ready.`,
+    `Schema:`,
+    `{`,
+    `  "artist": "string",`,
+    `  "album": "string",`,
+    `  "label": "string",`,
+    `  "catalogNumber": "string",`,
+    `  "confidence": number`,
+    `}`,
   ].join("\n");
 
   // ── Build Responses API input payload ──
-  // CRITICAL FIX: The Responses API input_image type requires image_url
-  // to be an OBJECT with a "url" property: { url: "https://..." }
-  // The old code passed a bare string which silently fails.
+  // image_url is a bare string (confirmed working with /v1/responses)
   const contentItems = [
     { type: "input_text", text: systemPrompt },
   ];
   for (const imgUrl of images) {
     contentItems.push({
       type: "input_image",
-      image_url: imgUrl },
+      image_url: imgUrl,
     });
   }
 
@@ -511,9 +526,7 @@ async function callOpenAIForListing(env, images, hints) {
   _debug.parsedObject = parsed;
 
   return {
-    title:         safeStr(parsed.title)         || safeStr(parsed.album)  || "",
-    description:   safeStr(parsed.description)   || "",
-    artist:        safeStr(parsed.artist)         || "Unknown",
+    artist:        safeStr(parsed.artist)         || "",
     album:         safeStr(parsed.album)          || "",
     label:         safeStr(parsed.label)          || "",
     catalogNumber: safeStr(parsed.catalogNumber)  || "",
@@ -525,10 +538,8 @@ async function callOpenAIForListing(env, images, hints) {
 
 function fallbackResult(warnings, _debug) {
   return {
-    title: "",
-    description: "",
-    artist: "Unknown",
-    album: "Unknown",
+    artist: "",
+    album: "",
     label: "",
     catalogNumber: "",
     confidence: 0,
