@@ -1,7 +1,18 @@
 name = "whatnot-lister-v2"
 main = "worker.js"
-compatibility_date = "2026-02-10"
+compatibility_date = "2025-02-01"
+workers_dev = true
 
+# ===== R2 BINDING =====
 [[r2_buckets]]
 binding = "R2"
 bucket_name = "media-assets"
+
+# ===== OBSERVABILITY (LOGS ONLY) =====
+[observability]
+enabled = false
+
+[observability.logs]
+enabled = true
+persist = true
+invocation_logs = true
