@@ -57,8 +57,12 @@ export default {
         });
       }
 
+      // Apply optional CF Image Resizing
+      const { urls: aiImageUrls, cfWarnings } = transformImageUrls(imageUrls, env);
+
       // 2. Call OpenAI — same function as /process
-      const ai = await callOpenAIForListing(env, imageUrls, { folder, label: rule.label, id });
+      const ai = await callOpenAIForListing(env, aiImageUrls, { folder, label: rule.label, id });
+      const allWarnings = [...(ai.warnings || []), ...cfWarnings];
 
       // 3. Build final title/description — same logic as /process
       const { title: finalTitle, description: finalDescription } = buildTitleDesc(ai, rule, id);
@@ -67,6 +71,7 @@ export default {
         id,
         folder,
         image_urls: imageUrls,
+        image_urls_sent: aiImageUrls,
         model_used: ai._debug?.model_used ?? null,
         model_attempts: ai._debug?.model_attempts ?? [],
         openai_status: ai._debug?.status ?? null,
@@ -75,7 +80,7 @@ export default {
         parsed_object: ai._debug?.parsedObject ?? null,
         final_title: finalTitle,
         final_description: finalDescription,
-        warnings: ai.warnings || [],
+        warnings: allWarnings,
         missing_variants: missingVariants,
         openai_request_body_preview: ai._debug?.requestBodyPreview ?? null,
       });
@@ -122,14 +127,17 @@ export default {
           continue;
         }
 
-        // AI call
-        const ai = await callOpenAIForListing(env, imageUrls, { folder, label: rule.label, id });
+        // Apply optional CF Image Resizing for OpenAI
+        const { urls: aiImageUrls, cfWarnings } = transformImageUrls(imageUrls, env);
+
+        // AI call (send transformed URLs to OpenAI)
+        const ai = await callOpenAIForListing(env, aiImageUrls, { folder, label: rule.label, id });
 
         idDebug.openai = {
           status: ai._debug?.status,
           error: ai._debug?.error,
           rawPreview: ai._debug?.rawPreview,
-          warnings: ai.warnings,
+          warnings: [...(ai.warnings || []), ...cfWarnings],
         };
         if (debug) debugLogs.push(idDebug);
 
@@ -167,10 +175,14 @@ export default {
       ];
       const csv = toCsv(csvHeaders, rows);
 
+      const csvFilename = `whatnot_upload_${Date.now()}.csv`;
+
       return new Response(csv, {
         headers: {
           "content-type": "text/csv; charset=UTF-8",
-          "content-disposition": `attachment; filename="whatnot_upload.csv"`,
+          "content-disposition": `attachment; filename="${csvFilename}"`,
+          "cache-control": "no-store, max-age=0",
+          "pragma": "no-cache",
         },
       });
     }
@@ -228,7 +240,7 @@ function buildTitleDesc(ai, rule, id) {
   }
 
   lines.push("Condition unknown; see photos.");
-  lines.push("Ships fast & packed safely.");
+  lines.push("Ships fast & packed safely in an LP mailer.");
 
   const description = clampDesc(noEmoji(lines.join("\n")));
 
@@ -319,9 +331,20 @@ function htmlPage(env) {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+function resolveApiKey(env) {
+  return env.OPENAI_API_KEY || env.OPEN_AI_KEY || "";
+}
+
 function assertEnv(env) {
   if (!env.IMAGE_BASE_URL) throw new Error("Missing IMAGE_BASE_URL.");
-  if (!env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY secret.");
+  if (!resolveApiKey(env)) throw new Error("Missing OPENAI_API_KEY (or legacy OPEN_AI_KEY) secret.");
+}
+
+function resolveModels(env) {
+  // MODEL_PRIMARY: explicit > legacy OPENAI_MODEL > default
+  const primary  = env.MODEL_PRIMARY || env.OPENAI_MODEL || "gpt-4o-mini";
+  const fallback = env.MODEL_FALLBACK || "gpt-4o";
+  return { primary, fallback };
 }
 
 function joinUrl(base, path) {
@@ -373,6 +396,35 @@ async function findImageUrl(baseUrl, folder, id, seq) {
   return null;
 }
 
+/**
+ * If env.IMAGE_CF == "1", rewrite URL through Cloudflare Image Resizing.
+ * Note: CF Image Resizing requires a zone with the feature enabled and
+ * does NOT work on r2.dev public URLs (they aren't behind a CF zone).
+ * If it looks like it would break (r2.dev domain), skip and warn.
+ */
+function transformImageUrls(urls, env) {
+  if (env.IMAGE_CF !== "1") return { urls, cfWarnings: [] };
+
+  const cfWarnings = [];
+  const transformed = urls.map((u) => {
+    try {
+      const parsed = new URL(u);
+      // r2.dev public URLs don't support /cdn-cgi/image/ transforms
+      if (parsed.hostname.endsWith(".r2.dev")) {
+        cfWarnings.push(`CF Image Resizing skipped for r2.dev URL: ${u}`);
+        return u;
+      }
+      const origin = parsed.origin;
+      const path = parsed.pathname;
+      return `${origin}/cdn-cgi/image/width=1400,fit=contain,metadata=none${path}`;
+    } catch {
+      cfWarnings.push(`Invalid URL, skipped CF transform: ${u}`);
+      return u;
+    }
+  });
+  return { urls: transformed, cfWarnings };
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // callOpenAIForListing — THE core AI function, used by both /process & /debug-one
 // ──────────────────────────────────────────────────────────────────────────────
@@ -390,8 +442,8 @@ async function findImageUrl(baseUrl, folder, id, seq) {
  * }>}
  */
 async function callOpenAIForListing(env, images, hints) {
-  const primaryModel  = env.MODEL_PRIMARY  || "gpt-4.1-mini";
-  const fallbackModel = env.MODEL_FALLBACK || "gpt-4o";
+  const { primary: primaryModel, fallback: fallbackModel } = resolveModels(env);
+  const apiKey = resolveApiKey(env);
   const warnings = [];
   const _debug = {
     status: null, error: null, rawPreview: null, parsedObject: null,
@@ -459,7 +511,7 @@ async function callOpenAIForListing(env, images, hints) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(requestBody),
         signal: ac.signal,
