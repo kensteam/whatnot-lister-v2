@@ -3,12 +3,83 @@ export default {
     const url = new URL(request.url);
     const debug = env.DEBUG === "true" || url.searchParams.get("debug") === "1";
 
+    // ── GET / ── HTML UI ──────────────────────────────────────────────────
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(htmlPage(env), {
         headers: { "content-type": "text/html; charset=UTF-8" },
       });
     }
 
+    // ── GET /debug-one?id=5000&folder=vinyl_lp ── single-item diagnostic ─
+    if (request.method === "GET" && url.pathname === "/debug-one") {
+      try { assertEnv(env); } catch (e) {
+        return jsonResp({ error: e.message }, 500);
+      }
+
+      const folder = url.searchParams.get("folder") || "vinyl_lp";
+      const id = Number(url.searchParams.get("id"));
+      if (!Number.isFinite(id) || id <= 0) {
+        return jsonResp({ error: "Pass ?id=<number> (positive integer)" }, 400);
+      }
+
+      const TYPE_RULES = typeRules();
+      const rule = TYPE_RULES[folder];
+      if (!rule) {
+        return jsonResp({ error: `Unknown folder "${folder}". Use: ${Object.keys(TYPE_RULES).join(", ")}` }, 400);
+      }
+
+      // 1. Resolve images — same logic as /process
+      const imageUrls = [];
+      const missingVariants = [];
+      for (let seq = 1; seq <= 8; seq++) {
+        const found = await findImageUrl(env.IMAGE_BASE_URL, folder, id, seq);
+        if (found) {
+          imageUrls.push(found);
+        } else {
+          missingVariants.push(`${id}_${seq} — no variant found`);
+          break;
+        }
+      }
+
+      if (imageUrls.length === 0) {
+        return jsonResp({
+          id,
+          folder,
+          image_urls: [],
+          openai_status: null,
+          openai_error: "No images found for this ID — nothing to send to OpenAI",
+          openai_raw_preview: null,
+          parsed_object: null,
+          final_title: "",
+          final_description: "",
+          warnings: [`No image variants exist for ${folder}/${id}_1`],
+          missing_variants: missingVariants,
+        });
+      }
+
+      // 2. Call OpenAI — same function as /process
+      const ai = await callOpenAIForListing(env, imageUrls, { folder, label: rule.label, id });
+
+      // 3. Build final title/description — same logic as /process
+      const { title: finalTitle, description: finalDescription } = buildTitleDesc(ai, rule, id);
+
+      return jsonResp({
+        id,
+        folder,
+        image_urls: imageUrls,
+        openai_status: ai._debug?.status ?? null,
+        openai_error: ai._debug?.error ?? null,
+        openai_raw_preview: ai._debug?.rawPreview ?? null,
+        parsed_object: ai._debug?.parsedObject ?? null,
+        final_title: finalTitle,
+        final_description: finalDescription,
+        warnings: ai.warnings || [],
+        missing_variants: missingVariants,
+        openai_request_body_preview: ai._debug?.requestBodyPreview ?? null,
+      });
+    }
+
+    // ── POST /process ── bulk CSV ─────────────────────────────────────────
     if (request.method === "POST" && url.pathname === "/process") {
       assertEnv(env);
 
@@ -23,29 +94,14 @@ export default {
         return new Response("Bad ID range.", { status: 400 });
       }
 
-      const TYPE_RULES = {
-        vinyl_lp:  { category: "Music", subcategory: "Vinyl Records",     price: 5, shipping: "1 lb",   label: "LP vinyl record" },
-        vinyl_45:  { category: "Music", subcategory: "Vinyl Records",     price: 3, shipping: "4-7 oz", label: "45 rpm vinyl record" },
-        cd:        { category: "Music", subcategory: "CDs & Cassettes",   price: 3, shipping: "4-7 oz", label: "CD" },
-        cassette:  { category: "Music", subcategory: "CDs & Cassettes",   price: 3, shipping: "4-7 oz", label: "Music cassette tape" },
-      };
-
-      const rule = TYPE_RULES[folder];
+      const rule = typeRules()[folder];
       const rows = [];
-      const debugLogs = []; // Collect debug info per ID
+      const debugLogs = [];
 
       for (let id = startId; id <= endId; id++) {
         const idDebug = { id, images: [], missingVariants: [], openai: {} };
 
-        // --- Check if primary image exists (try lowercase and uppercase extensions) ---
-        const firstResult = await findImageUrl(env.IMAGE_BASE_URL, folder, id, 1);
-        if (!firstResult) {
-          idDebug.missingVariants.push(`${id}_1 — no variant found (.jpg/.JPG/.JPEG)`);
-          if (debug) debugLogs.push(idDebug);
-          continue;
-        }
-
-        // --- Gather up to 8 images, trying extension variants ---
+        // Gather images
         const imageUrls = [];
         for (let seq = 1; seq <= 8; seq++) {
           const found = await findImageUrl(env.IMAGE_BASE_URL, folder, id, seq);
@@ -54,16 +110,18 @@ export default {
             idDebug.images.push(found);
           } else {
             idDebug.missingVariants.push(`${id}_${seq} — not found`);
-            break; // stop at first gap
+            break;
           }
         }
 
-        // --- AI call ---
-        const ai = await callOpenAIForListing(env, imageUrls, {
-          folder,
-          label: rule.label,
-          id,
-        });
+        if (imageUrls.length === 0) {
+          idDebug.missingVariants.push(`${id}_1 — no variant found (.jpg/.JPG/.JPEG/.jpeg)`);
+          if (debug) debugLogs.push(idDebug);
+          continue;
+        }
+
+        // AI call
+        const ai = await callOpenAIForListing(env, imageUrls, { folder, label: rule.label, id });
 
         idDebug.openai = {
           status: ai._debug?.status,
@@ -71,24 +129,10 @@ export default {
           rawPreview: ai._debug?.rawPreview,
           warnings: ai.warnings,
         };
-
         if (debug) debugLogs.push(idDebug);
 
-        const artist = ai.artist || "Unknown";
-        const album = ai.album || ai.title || "Unknown";
-
-        const title =
-          clamp50(noEmoji(`${artist} ${album} ${rule.label}`.trim())) ||
-          clamp50(noEmoji(`${rule.label} ${id}`));
-
-        const descParts = [
-          ai.description || `${artist} - ${album}.`,
-          ai.label ? `Label: ${ai.label}.` : "",
-          ai.catalogNumber ? `Cat#: ${ai.catalogNumber}.` : "",
-          "See photos. Ships fast.",
-        ].filter(Boolean).join(" ");
-
-        const description = clampDesc(noEmoji(descParts));
+        // Build final title/description with fallback
+        const { title, description } = buildTitleDesc(ai, rule, id);
 
         rows.push({
           Category: rule.category,
@@ -108,21 +152,18 @@ export default {
         });
       }
 
-      // --- DEBUG mode: return JSON diagnostics instead of CSV ---
+      // DEBUG → JSON
       if (debug) {
-        return new Response(JSON.stringify({ rowCount: rows.length, debugLogs, rows }, null, 2), {
-          headers: { "content-type": "application/json; charset=UTF-8" },
-        });
+        return jsonResp({ rowCount: rows.length, debugLogs, rows });
       }
 
-      // --- Normal mode: return CSV ---
-      const headers = [
+      // Normal → CSV
+      const csvHeaders = [
         "Category", "Sub Category", "Title", "Description", "Quantity", "Type", "Price", "Shipping Profile",
         "Offerable", "Hazmat", "Condition", "Cost Per Item", "SKU",
         "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4", "Image URL 5", "Image URL 6", "Image URL 7", "Image URL 8",
       ];
-
-      const csv = toCsv(headers, rows);
+      const csv = toCsv(csvHeaders, rows);
 
       return new Response(csv, {
         headers: {
@@ -137,7 +178,54 @@ export default {
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// HTML UI (unchanged except cosmetic)
+// TYPE_RULES (shared between routes)
+// ──────────────────────────────────────────────────────────────────────────────
+
+function typeRules() {
+  return {
+    vinyl_lp:  { category: "Music", subcategory: "Vinyl Records",   price: 5, shipping: "1 lb",   label: "LP vinyl record" },
+    vinyl_45:  { category: "Music", subcategory: "Vinyl Records",   price: 3, shipping: "4-7 oz", label: "45 rpm vinyl record" },
+    cd:        { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "CD" },
+    cassette:  { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "Music cassette tape" },
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Build title + description from AI result (shared logic, with fallback)
+// ──────────────────────────────────────────────────────────────────────────────
+
+function buildTitleDesc(ai, rule, id) {
+  const artist = ai.artist && ai.artist !== "Unknown" ? ai.artist : "";
+  const album  = ai.album  && ai.album  !== "Unknown" ? ai.album  : (ai.title || "");
+
+  // Try AI-derived title first
+  let title = "";
+  if (artist || album) {
+    title = clamp50(noEmoji(`${artist} ${album} ${rule.label}`.trim()));
+  }
+  // Fallback: guaranteed non-blank
+  if (!title) {
+    title = clamp50(noEmoji(`${rule.label} Lot ${id}`));
+  }
+
+  // Description
+  const descParts = [];
+  if (ai.description) {
+    descParts.push(ai.description);
+  } else if (artist || album) {
+    descParts.push(`${artist} - ${album}.`.replace(/^\s*-\s*/, "").trim());
+  }
+  if (ai.label)         descParts.push(`Label: ${ai.label}.`);
+  if (ai.catalogNumber) descParts.push(`Cat#: ${ai.catalogNumber}.`);
+  descParts.push("See photos. Ships fast.");
+
+  const description = clampDesc(noEmoji(descParts.filter(Boolean).join(" ")));
+
+  return { title, description };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HTML UI
 // ──────────────────────────────────────────────────────────────────────────────
 
 function htmlPage(env) {
@@ -197,10 +285,18 @@ function htmlPage(env) {
         <input name="endId" inputmode="numeric" placeholder="5004" required />
 
         <div style="margin-top:12px;">
-          <button type="submit">Process Images → Download CSV</button>
+          <button type="submit">Process Images &rarr; Download CSV</button>
         </div>
-        <div class="note">Scans IDs and includes only ones where <code>_1.jpg</code> exists. Tip: add <code>?debug=1</code> to see diagnostics.</div>
+        <div class="note">Scans IDs and includes only ones where <code>_1.jpg</code> exists.</div>
       </form>
+    </div>
+
+    <div class="card">
+      <h2>3) Debug single item</h2>
+      <div class="note">
+        <code>GET /debug-one?folder=vinyl_lp&amp;id=5000</code> &mdash;
+        returns raw OpenAI response, resolved image URLs, parsed object, and final title/description.
+      </div>
     </div>
 
   </div>
@@ -209,7 +305,7 @@ function htmlPage(env) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Environment assertion
+// Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
 function assertEnv(env) {
@@ -217,18 +313,21 @@ function assertEnv(env) {
   if (!env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY secret.");
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// URL helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
 function joinUrl(base, path) {
   const b = String(base || "").replace(/\/+$/, "");
   const p = String(path || "").replace(/^\/+/, "");
   return `${b}/${p}`;
 }
 
+function jsonResp(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { "content-type": "application/json; charset=UTF-8" },
+  });
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
-// Image existence check (Range GET, with extension fallback)
+// Image existence (Range GET + extension fallback)
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function existsFast(u) {
@@ -249,10 +348,6 @@ async function existsFast(u) {
   }
 }
 
-/**
- * Try .jpg, .JPG, .JPEG for a given id/seq.
- * Returns the first URL that exists, or null.
- */
 async function findImageUrl(baseUrl, folder, id, seq) {
   const variants = [
     `${folder}/${id}_${seq}.jpg`,
@@ -268,63 +363,63 @@ async function findImageUrl(baseUrl, folder, id, seq) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Core AI function: callOpenAIForListing
+// callOpenAIForListing — THE core AI function, used by both /process & /debug-one
 // ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * Calls the OpenAI Responses API with image URLs and returns structured listing data.
- *
- * @param {object} env  - Worker env (needs OPENAI_API_KEY, optional OPENAI_MODEL)
- * @param {string[]} images - Array of full public image URLs
- * @param {object} hints - { folder, label, id }
+ * @param {object} env
+ * @param {string[]} images  - full public image URLs
+ * @param {{ folder: string, label: string, id: number }} hints
  * @returns {Promise<{
  *   title: string, description: string,
- *   artist?: string, album?: string, label?: string, catalogNumber?: string,
- *   confidence?: number, warnings?: string[],
- *   _debug?: { status: number, error?: string, rawPreview?: string }
+ *   artist: string, album: string, label: string, catalogNumber: string,
+ *   confidence?: number, warnings: string[],
+ *   _debug: { status?: number, error?: string, rawPreview?: string,
+ *             parsedObject?: object, requestBodyPreview?: string }
  * }>}
  */
 async function callOpenAIForListing(env, images, hints) {
   const model = env.OPENAI_MODEL || "gpt-4o-mini";
   const warnings = [];
-  const _debug = {};
+  const _debug = { status: null, error: null, rawPreview: null, parsedObject: null, requestBodyPreview: null };
 
-  const systemPrompt = `You are a music media identification expert. You will be shown photos of a ${hints.label}.
-Respond with ONLY valid JSON, no markdown fences, no preamble, no trailing text.
-Schema:
-{
-  "artist": "string",
-  "album": "string",
-  "title": "string (short listing title)",
-  "description": "string (1-2 sentence selling description)",
-  "label": "string or empty (record label if visible)",
-  "catalogNumber": "string or empty",
-  "confidence": 0.0-1.0
-}
-Best guess if unsure. No emojis. Keep artist/album short.`;
+  const systemPrompt = [
+    `You are a music media identification expert. You will be shown photos of a ${hints.label}.`,
+    `Respond with ONLY valid JSON — no markdown fences, no preamble, no trailing text.`,
+    `Schema: {"artist":"string","album":"string","title":"string (short listing title)",`,
+    `"description":"string (1-2 sentence selling description)",`,
+    `"label":"string or empty (record label if visible)",`,
+    `"catalogNumber":"string or empty","confidence":0.0-1.0}`,
+    `Best guess if unsure. No emojis. Keep artist/album short.`,
+  ].join("\n");
 
-  // Build input content array: text instruction + all images
+  // ── Build Responses API input payload ──
+  // CRITICAL FIX: The Responses API input_image type requires image_url
+  // to be an OBJECT with a "url" property: { url: "https://..." }
+  // The old code passed a bare string which silently fails.
   const contentItems = [
     { type: "input_text", text: systemPrompt },
   ];
   for (const imgUrl of images) {
     contentItems.push({
       type: "input_image",
-      image_url: imgUrl,
+      image_url: { url: imgUrl },
     });
   }
 
-  const body = {
+  const requestBody = {
     model,
     input: [
-      {
-        role: "user",
-        content: contentItems,
-      },
+      { role: "user", content: contentItems },
     ],
   };
 
-  // Timeout guard: 30 seconds
+  // Stash a preview of what we're sending (visible in /debug-one)
+  try {
+    _debug.requestBodyPreview = JSON.stringify(requestBody).slice(0, 1200);
+  } catch { /* ignore */ }
+
+  // ── Fire the request with a 30-second timeout guard ──
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 30000);
 
@@ -337,7 +432,7 @@ Best guess if unsure. No emojis. Keep artist/album short.`;
         "content-type": "application/json",
         authorization: `Bearer ${env.OPENAI_API_KEY}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(requestBody),
       signal: ac.signal,
     });
     _debug.status = resp.status;
@@ -345,71 +440,78 @@ Best guess if unsure. No emojis. Keep artist/album short.`;
     _debug.rawPreview = rawText.slice(0, 1200);
   } catch (err) {
     _debug.status = 0;
-    _debug.error = `Fetch error: ${err.message || err}`;
+    _debug.error = `Fetch failed: ${err.message || String(err)}`;
     warnings.push(_debug.error);
-    return fallbackResult(hints, warnings, _debug);
+    return fallbackResult(warnings, _debug);
   } finally {
     clearTimeout(timer);
   }
 
+  // ── Non-200 → surface the error, NEVER swallow ──
   if (!resp.ok) {
-    _debug.error = `OpenAI HTTP ${resp.status}: ${rawText.slice(0, 500)}`;
+    _debug.error = `OpenAI HTTP ${resp.status}: ${rawText.slice(0, 600)}`;
     warnings.push(_debug.error);
-    return fallbackResult(hints, warnings, _debug);
+    return fallbackResult(warnings, _debug);
   }
 
-  // Parse the response JSON envelope
+  // ── Parse the JSON envelope ──
   let data;
   try {
     data = JSON.parse(rawText);
   } catch (err) {
-    _debug.error = `JSON envelope parse error: ${err.message}`;
+    _debug.error = `Response JSON parse error: ${err.message}`;
     warnings.push(_debug.error);
-    return fallbackResult(hints, warnings, _debug);
+    return fallbackResult(warnings, _debug);
   }
 
-  // --- Extract the model's text output ---
-  // Responses API: prefer data.output_text (convenience field)
-  // Fallback: traverse data.output[].content[] looking for type=output_text
+  // ── Extract model text ──
+  // Responses API: prefer data.output_text (top-level convenience field).
+  // Fallback: traverse data.output[] → message → content[] → output_text or text block.
   let outputText = "";
 
   if (typeof data.output_text === "string" && data.output_text.trim()) {
     outputText = data.output_text.trim();
   } else if (Array.isArray(data.output)) {
+    outer:
     for (const item of data.output) {
       if (item.type === "message" && Array.isArray(item.content)) {
         for (const block of item.content) {
           if (block.type === "output_text" && typeof block.text === "string") {
             outputText = block.text.trim();
-            break;
+            break outer;
+          }
+          if (block.type === "text" && typeof block.text === "string") {
+            outputText = block.text.trim();
+            break outer;
           }
         }
       }
-      if (outputText) break;
     }
   }
 
   if (!outputText) {
-    _debug.error = "No output_text found in response";
+    _debug.error = "No output_text found in OpenAI response. Top-level keys: " + Object.keys(data).join(", ");
     warnings.push(_debug.error);
-    return fallbackResult(hints, warnings, _debug);
+    return fallbackResult(warnings, _debug);
   }
 
-  // Strip markdown fences if present
+  // Strip markdown fences if the model wrapped them
   outputText = outputText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
 
-  // Parse the model's JSON
+  // ── Parse the model's JSON ──
   let parsed;
   try {
     parsed = JSON.parse(outputText);
   } catch (err) {
-    _debug.error = `Model JSON parse error: ${err.message}`;
-    warnings.push(`Failed to parse model JSON. Raw: ${outputText.slice(0, 300)}`);
-    return fallbackResult(hints, warnings, _debug);
+    _debug.error = `Model JSON parse failed: ${err.message}`;
+    warnings.push(`JSON parse failed. Raw output: ${outputText.slice(0, 400)}`);
+    return fallbackResult(warnings, _debug);
   }
 
+  _debug.parsedObject = parsed;
+
   return {
-    title:         safeStr(parsed.title)         || safeStr(parsed.album) || "",
+    title:         safeStr(parsed.title)         || safeStr(parsed.album)  || "",
     description:   safeStr(parsed.description)   || "",
     artist:        safeStr(parsed.artist)         || "Unknown",
     album:         safeStr(parsed.album)          || "",
@@ -421,7 +523,7 @@ Best guess if unsure. No emojis. Keep artist/album short.`;
   };
 }
 
-function fallbackResult(hints, warnings, _debug) {
+function fallbackResult(warnings, _debug) {
   return {
     title: "",
     description: "",
