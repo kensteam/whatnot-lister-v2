@@ -67,6 +67,8 @@ export default {
         id,
         folder,
         image_urls: imageUrls,
+        model_used: ai._debug?.model_used ?? null,
+        model_attempts: ai._debug?.model_attempts ?? [],
         openai_status: ai._debug?.status ?? null,
         openai_error: ai._debug?.error ?? null,
         openai_raw_preview: ai._debug?.rawPreview ?? null,
@@ -388,9 +390,13 @@ async function findImageUrl(baseUrl, folder, id, seq) {
  * }>}
  */
 async function callOpenAIForListing(env, images, hints) {
-  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  const primaryModel  = env.MODEL_PRIMARY  || "gpt-4.1-mini";
+  const fallbackModel = env.MODEL_FALLBACK || "gpt-4o";
   const warnings = [];
-  const _debug = { status: null, error: null, rawPreview: null, parsedObject: null, requestBodyPreview: null };
+  const _debug = {
+    status: null, error: null, rawPreview: null, parsedObject: null,
+    requestBodyPreview: null, model_used: null, model_attempts: [],
+  };
 
   const systemPrompt = [
     `You are identifying an ${hints.label} from photos for an auction listing.`,
@@ -410,7 +416,7 @@ async function callOpenAIForListing(env, images, hints) {
     `}`,
   ].join("\n");
 
-  // ── Build Responses API input payload ──
+  // ── Build Responses API input payload (model inserted per attempt) ──
   // image_url is a bare string (confirmed working with /v1/responses)
   const contentItems = [
     { type: "input_text", text: systemPrompt },
@@ -422,44 +428,83 @@ async function callOpenAIForListing(env, images, hints) {
     });
   }
 
-  const requestBody = {
-    model,
-    input: [
-      { role: "user", content: contentItems },
-    ],
-  };
-
-  // Stash a preview of what we're sending (visible in /debug-one)
-  try {
-    _debug.requestBodyPreview = JSON.stringify(requestBody).slice(0, 1200);
-  } catch { /* ignore */ }
-
-  // ── Fire the request with a 30-second timeout guard ──
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 30000);
-
-  let resp;
+  // ── Try primary model, fallback on 403 model_not_found ──
+  const modelsToTry = [primaryModel, fallbackModel];
+  let resp = null;
   let rawText = "";
-  try {
-    resp = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify(requestBody),
-      signal: ac.signal,
-    });
+
+  for (const model of modelsToTry) {
+    const requestBody = {
+      model,
+      input: [
+        { role: "user", content: contentItems },
+      ],
+    };
+
+    // Stash request preview on first attempt
+    if (_debug.model_attempts.length === 0) {
+      try {
+        _debug.requestBodyPreview = JSON.stringify(requestBody).slice(0, 1200);
+      } catch { /* ignore */ }
+    }
+
+    const attempt = { model, status: null, error: null };
+    _debug.model_attempts.push(attempt);
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 30000);
+
+    try {
+      resp = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify(requestBody),
+        signal: ac.signal,
+      });
+      attempt.status = resp.status;
+      rawText = await resp.text();
+    } catch (err) {
+      attempt.status = 0;
+      attempt.error = `Fetch failed: ${err.message || String(err)}`;
+      warnings.push(`[${model}] ${attempt.error}`);
+      clearTimeout(timer);
+      // If fetch itself failed, try next model
+      resp = null;
+      rawText = "";
+      continue;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // ── Check for 403 model_not_found → retry with fallback ──
+    if (resp.status === 403) {
+      const is403ModelNotFound =
+        rawText.includes("model_not_found") ||
+        rawText.includes("does not have access");
+      if (is403ModelNotFound && model !== fallbackModel) {
+        attempt.error = `403 model_not_found for ${model}, trying fallback`;
+        warnings.push(attempt.error);
+        resp = null;
+        rawText = "";
+        continue; // next model
+      }
+    }
+
+    // Got a response (success or non-retryable error) — stop trying
+    _debug.model_used = model;
     _debug.status = resp.status;
-    rawText = await resp.text();
     _debug.rawPreview = rawText.slice(0, 1200);
-  } catch (err) {
-    _debug.status = 0;
-    _debug.error = `Fetch failed: ${err.message || String(err)}`;
+    break;
+  }
+
+  // ── No response at all (both models failed at fetch level) ──
+  if (!resp) {
+    _debug.error = "All model attempts failed";
     warnings.push(_debug.error);
     return fallbackResult(warnings, _debug);
-  } finally {
-    clearTimeout(timer);
   }
 
   // ── Non-200 → surface the error, NEVER swallow ──
