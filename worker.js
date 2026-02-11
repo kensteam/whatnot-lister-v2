@@ -9,30 +9,20 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/process") {
-      // REQUIRED env
-      if (!env.OPENAI_API_KEY) return text("Missing OPENAI_API_KEY", 500);
-      if (!env.IMAGE_BASE_URL) return text("Missing IMAGE_BASE_URL", 500);
+      assertEnv(env);
 
-      // UI inputs
       const form = await request.formData();
       const folder = (form.get("folder") || "").toString().trim();
       const startId = Number((form.get("startId") || "").toString().trim());
       const endId = Number((form.get("endId") || "").toString().trim());
 
       const allowedFolders = new Set(["vinyl_lp", "vinyl_45", "cd", "cassette"]);
-      if (!allowedFolders.has(folder)) return text("Bad folder", 400);
-      if (!Number.isFinite(startId) || !Number.isFinite(endId) || startId <= 0 || endId <= 0 || endId < startId) {
-        return text("Bad ID range", 400);
+      if (!allowedFolders.has(folder)) return new Response("Bad folder.", { status: 400 });
+      if (!Number.isFinite(startId) || !Number.isFinite(endId) || startId <= 0 || endId < startId) {
+        return new Response("Bad ID range.", { status: 400 });
       }
 
-      // hard limits so you don’t nuke your own server
-      const MAX_ITEMS = 200;      // max IDs per run
-      const MAX_IMAGES = 8;       // per item
-      const CONCURRENCY = 8;      // parallel HEADs
-
-      const ids = [];
-      for (let i = startId; i <= endId && ids.length < MAX_ITEMS; i++) ids.push(i);
-
+      // locked pricing + shipping
       const TYPE_RULES = {
         vinyl_lp: { category: "Music", subcategory: "Vinyl Records", price: 5, shipping: "1 lb", label: "LP vinyl record" },
         vinyl_45: { category: "Music", subcategory: "Vinyl Records", price: 3, shipping: "4-7 oz", label: "45 rpm vinyl record" },
@@ -40,39 +30,27 @@ export default {
         cassette: { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "Music cassette tape" },
       };
 
-      const DEFAULTS = {
-        quantity: 1,
-        type: "Auction",
-        offerable: "TRUE",
-        hazmat: "Not Hazmat",
-        condition: "",
-        costPerItem: "",
-      };
+      const rule = TYPE_RULES[folder];
 
-      const base = env.IMAGE_BASE_URL.replace(/\/+$/, ""); // no trailing slash
       const rows = [];
+      for (let id = startId; id <= endId; id++) {
+        // Existence check: GET with Range instead of HEAD (many file servers block HEAD)
+        const firstUrl = joinUrl(env.IMAGE_BASE_URL, `${folder}/${id}_1.jpg`);
+        const exists = await existsFast(firstUrl);
+        if (!exists) continue;
 
-      // Find which IDs exist by checking _1.jpg
-      const exists = await headScan(ids, CONCURRENCY, (id) => `${base}/${folder}/${id}_1.jpg`);
-
-      for (const id of exists) {
-        // Collect up to 8 images (stop when a slot missing)
+        // Gather up to 8 images: stop when a seq is missing
         const imageUrls = [];
-        for (let seq = 1; seq <= MAX_IMAGES; seq++) {
-          const u = `${base}/${folder}/${id}_${seq}.jpg`;
-          const ok = await headOk(u);
-          if (!ok) break;
-          imageUrls.push(u);
+        for (let seq = 1; seq <= 8; seq++) {
+          const u = joinUrl(env.IMAGE_BASE_URL, `${folder}/${id}_${seq}.jpg`);
+          if (await existsFast(u)) imageUrls.push(u);
+          else break;
         }
 
-        const rule = TYPE_RULES[folder];
+        // AI pull (artist/title) from image 1
+        const ai = await readMusicFromImage(env, imageUrls[0]);
 
-        // AI pulls artist/title from the FIRST image URL
-        const ai = await readMusicFromImage(env, imageUrls[0] || "");
-
-        const title = clamp50(noEmoji(`${ai.artist} ${ai.title} ${rule.label}`.trim())) ||
-                      clamp50(noEmoji(`${rule.label} ${id}`));
-
+        const title = clamp50(noEmoji(`${ai.artist} ${ai.title} ${rule.label}`.trim())) || clamp50(noEmoji(`${rule.label} ${id}`));
         const description = clampDesc(noEmoji(`${ai.artist} - ${ai.title}. See photos. Ships fast.`));
 
         rows.push({
@@ -80,41 +58,23 @@ export default {
           "Sub Category": rule.subcategory,
           Title: title,
           Description: description,
-          Quantity: DEFAULTS.quantity,
-          Type: DEFAULTS.type,
+          Quantity: 1,
+          Type: "Auction",
           Price: rule.price,
           "Shipping Profile": rule.shipping,
-          Offerable: DEFAULTS.offerable,
-          Hazmat: DEFAULTS.hazmat,
-          Condition: DEFAULTS.condition,
-          "Cost Per Item": DEFAULTS.costPerItem,
-          SKU: String(id),
+          Offerable: "TRUE",
+          Hazmat: "Not Hazmat",
+          Condition: "",
+          "Cost Per Item": "",
+          SKU: `${id}`,
           ...toImageCols(imageUrls),
         });
       }
 
       const headers = [
-        "Category",
-        "Sub Category",
-        "Title",
-        "Description",
-        "Quantity",
-        "Type",
-        "Price",
-        "Shipping Profile",
-        "Offerable",
-        "Hazmat",
-        "Condition",
-        "Cost Per Item",
-        "SKU",
-        "Image URL 1",
-        "Image URL 2",
-        "Image URL 3",
-        "Image URL 4",
-        "Image URL 5",
-        "Image URL 6",
-        "Image URL 7",
-        "Image URL 8",
+        "Category","Sub Category","Title","Description","Quantity","Type","Price","Shipping Profile",
+        "Offerable","Hazmat","Condition","Cost Per Item","SKU",
+        "Image URL 1","Image URL 2","Image URL 3","Image URL 4","Image URL 5","Image URL 6","Image URL 7","Image URL 8",
       ];
 
       const csv = toCsv(headers, rows);
@@ -127,12 +87,12 @@ export default {
       });
     }
 
-    return text("Not found", 404);
+    return new Response("Not found", { status: 404 });
   },
 };
 
 function htmlPage(env) {
-  const base = (env.IMAGE_BASE_URL || "http://24.158.206.165:12345").replace(/\/+$/, "");
+  const base = (env && env.IMAGE_BASE_URL) ? String(env.IMAGE_BASE_URL) : "";
   return `<!doctype html>
 <html>
 <head>
@@ -148,8 +108,8 @@ function htmlPage(env) {
     input,select{width:100%;padding:12px;border-radius:10px;border:1px solid #ccc;font-size:16px;}
     button{font-size:18px;padding:14px 18px;border-radius:12px;border:1px solid #ddd;background:#f4f4f4;cursor:pointer}
     .row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
-    .note{color:#444;font-size:13px;margin-top:8px;word-break:break-all}
-    code{background:#f2f2f2;padding:2px 6px;border-radius:6px}
+    .note{color:#444;font-size:13px;margin-top:8px}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
   </style>
 </head>
 <body>
@@ -158,8 +118,8 @@ function htmlPage(env) {
 
     <div class="card">
       <h2>1) Confirm server path</h2>
-      <div class="note">This worker reads images directly from: <code>${base}</code></div>
-      <div class="note">Example: <code>${base}/vinyl_lp/5000_1.jpg</code></div>
+      <div class="note">Worker reads directly from: <code>${escapeHtml(base)}</code></div>
+      <div class="note">Example: <code>${escapeHtml(base ? base.replace(/\\/+$/,"") : "")}/vinyl_lp/5000_1.jpg</code></div>
     </div>
 
     <div class="card">
@@ -180,13 +140,14 @@ function htmlPage(env) {
             <input name="startId" inputmode="numeric" placeholder="5000" required />
           </div>
         </div>
+
         <label>End ID</label>
-        <input name="endId" inputmode="numeric" placeholder="5099" required />
+        <input name="endId" inputmode="numeric" placeholder="5004" required />
 
         <div style="margin-top:12px;">
           <button type="submit">Process Images → Download CSV</button>
         </div>
-        <div class="note">It scans IDs and includes only ones where <code>_1.jpg</code> exists.</div>
+        <div class="note">Scans IDs and includes only ones where <code>_1.jpg</code> exists.</div>
       </form>
     </div>
 
@@ -195,36 +156,34 @@ function htmlPage(env) {
 </html>`;
 }
 
-function text(msg, status = 200) {
-  return new Response(msg, { status, headers: { "content-type": "text/plain; charset=UTF-8" } });
+function assertEnv(env) {
+  if (!env.IMAGE_BASE_URL) throw new Error("Missing IMAGE_BASE_URL.");
+  if (!env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY secret.");
 }
 
-async function headOk(u) {
+function joinUrl(base, path) {
+  const b = String(base || "").replace(/\/+$/, "");
+  const p = String(path || "").replace(/^\/+/, "");
+  return `${b}/${p}`;
+}
+
+// GET Range=0-0 avoids downloading full images AND works when HEAD is blocked.
+async function existsFast(u) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 4000);
   try {
-    const r = await fetch(u, { method: "HEAD" });
+    const r = await fetch(u, {
+      method: "GET",
+      headers: { "Range": "bytes=0-0" },
+      signal: ac.signal,
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
     return r.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(t);
   }
-}
-
-async function headScan(ids, concurrency, urlForId) {
-  const out = [];
-  let i = 0;
-
-  async function worker() {
-    while (i < ids.length) {
-      const id = ids[i++];
-      const u = urlForId(id);
-      const ok = await headOk(u);
-      if (ok) out.push(id);
-    }
-  }
-
-  const n = Math.max(1, Math.min(concurrency, 16));
-  await Promise.all(Array.from({ length: n }, worker));
-  out.sort((a, b) => a - b);
-  return out;
 }
 
 function toImageCols(urls) {
@@ -248,7 +207,7 @@ function clampDesc(s) {
 }
 
 function escCsv(v) {
-  const s = v === null || v === undefined ? "" : String(v);
+  const s = (v === null || v === undefined) ? "" : String(v);
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
@@ -261,42 +220,38 @@ function toCsv(headers, rows) {
 }
 
 async function readMusicFromImage(env, imageUrl) {
-  if (!imageUrl) return { artist: "Unknown", title: "Unknown" };
-
   const model = env.OPENAI_MODEL || "gpt-4o-mini";
-  const prompt =
-    "Extract listing basics from a photo of music media packaging. " +
-    "Return JSON only with keys: artist, title. " +
-    "If unsure, best guess. Short, clean, no emojis.";
+  const prompt = `
+Return JSON only: {"artist":"...","title":"..."}
+You are looking at a photo of music media packaging/label.
+Best guess if unsure. No emojis. Keep short.
+`.trim();
 
   const body = {
     model,
-    input: [
-      {
-        role: "user",
-        content: [
-          { type: "input_text", text: prompt },
-          { type: "input_image", image_url: imageUrl },
-        ],
-      },
-    ],
+    input: [{
+      role: "user",
+      content: [
+        { type: "input_text", text: prompt },
+        { type: "input_image", image_url: imageUrl },
+      ],
+    }],
   };
 
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) return { artist: "Unknown", title: "Unknown" };
+
+  const data = await resp.json();
+  const text = (data.output_text || "").trim();
   try {
-    const resp = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!resp.ok) return { artist: "Unknown", title: "Unknown" };
-
-    const data = await resp.json();
-    const text = (data.output_text || "").trim();
-
     const j = JSON.parse(text);
     return {
       artist: (j.artist || "Unknown").toString().trim(),
@@ -305,4 +260,12 @@ async function readMusicFromImage(env, imageUrl) {
   } catch {
     return { artist: "Unknown", title: "Unknown" };
   }
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
