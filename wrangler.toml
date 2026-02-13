@@ -4,4 +4,12 @@ compatibility_date = "2025-02-01"
 
 [vars]
 IMAGE_BASE_URL = "https://pub-7b33935cac0d41f3b1200955c2c5ecf5.r2.dev"
-OPENAI_MODEL = "gpt-4o-mini"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+head_sampling_rate = 1
