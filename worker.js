@@ -95,7 +95,7 @@ export default {
       const startId = Number((form.get("startId") || "").toString().trim());
       const endId = Number((form.get("endId") || "").toString().trim());
 
-      const allowedFolders = new Set(["vinyl_lp", "vinyl_45", "cd", "cassette", "books", "dvd"]);
+      const allowedFolders = new Set(["vinyl_lp", "vinyl_45", "cd", "cassette", "books", "dvd", "magazines"]);
       if (!allowedFolders.has(folder)) return new Response("Bad folder.", { status: 400 });
       if (!Number.isFinite(startId) || !Number.isFinite(endId) || startId <= 0 || endId < startId) {
         return new Response("Bad ID range.", { status: 400 });
@@ -209,8 +209,9 @@ function typeRules() {
     vinyl_45:  { category: "Music", subcategory: "Vinyl Records",   price: 3, shipping: "4-7 oz", label: "45 rpm vinyl record" },
     cd:        { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "CD" },
     cassette:  { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "Music cassette tape" },
-    books:     { category: "Books", subcategory: "New & Used Books", price: 5, shipping: "",      label: "Book",             condition: "Good", minImages: 2 },
-    dvd:       { category: "Movies & TV", subcategory: "DVD",       price: 3, shipping: "4-7 oz", label: "DVD or Blu-ray disc", condition: "Good", minImages: 2 },
+    books:     { category: "Books", subcategory: "New & Used Books", price: 5, shipping: "",      label: "Book",               condition: "Good", minImages: 4 },
+    dvd:       { category: "Movies & TV", subcategory: "DVD",       price: 3, shipping: "4-7 oz", label: "DVD or Blu-ray disc", condition: "Good", minImages: 4 },
+    magazines: { category: "Books", subcategory: "",                 price: 5, shipping: "",       label: "Magazine",            condition: "Good", minImages: 4 },
   };
 }
 
@@ -221,6 +222,7 @@ function typeRules() {
 function buildTitleDesc(ai, rule, id, folder) {
   if (folder === "books") return buildBookTitleDesc(ai, rule, id);
   if (folder === "dvd") return buildDvdTitleDesc(ai, rule, id);
+  if (folder === "magazines") return buildMagazineTitleDesc(ai, rule, id);
   return buildVinylTitleDesc(ai, rule, id);
 }
 
@@ -335,6 +337,34 @@ function resolveDvdSubCategory(ai) {
   return "DVD";
 }
 
+function buildMagazineTitleDesc(ai, rule, id) {
+  const magTitle = safeStr(ai.title);
+  const issueDate = safeStr(ai.issueDate);
+
+  let title = "";
+  if (magTitle && issueDate) {
+    title = `${magTitle} - ${issueDate}`;
+    if (title.length > 50) title = magTitle;
+  } else if (magTitle) {
+    title = magTitle;
+  } else {
+    title = `Magazine Lot ${id}`;
+  }
+  title = clamp50(noEmoji(title));
+
+  const lines = [];
+  if (magTitle) {
+    lines.push(`${magTitle} magazine.`);
+  } else {
+    lines.push("Magazine (see photos).");
+  }
+  if (issueDate) lines.push(`Issue: ${issueDate}.`);
+  lines.push("Condition: Good. See photos. Ships fast.");
+  const description = clampDesc(noEmoji(lines.join(" ")));
+
+  return { title, description };
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // HTML UI
 // ──────────────────────────────────────────────────────────────────────────────
@@ -350,69 +380,123 @@ function htmlPage(env) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Whatnot Lister v2</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#fff;}
-    .wrap{max-width:900px;margin:40px auto;padding:0 16px;}
-    h1{font-size:34px;margin:0 0 16px;}
-    .card{border:1px solid #e6e6e6;border-radius:14px;padding:14px;margin:12px 0;}
-    label{display:block;font-weight:600;margin:10px 0 6px;}
-    input,select{width:100%;padding:12px;border-radius:10px;border:1px solid #ccc;font-size:16px;}
-    button{font-size:18px;padding:14px 18px;border-radius:12px;border:1px solid #ddd;background:#f4f4f4;cursor:pointer}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
-    .note{color:#444;font-size:13px;margin-top:8px}
-    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
+    :root {
+      --bg: #0b0d10;
+      --surface: #12151a;
+      --surface2: #1a1e25;
+      --border: #2a2f3a;
+      --text: #e2e4e9;
+      --text-dim: #6b7280;
+      --green: #10b981;
+      --green-dim: #059669;
+      --green-glow: rgba(16,185,129,.12);
+      --radius: 10px;
+    }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:'DM Sans',sans-serif; margin:0; background:var(--bg); color:var(--text); min-height:100vh; }
+    .wrap { max-width:720px; margin:0 auto; padding:32px 16px; }
+    .header { display:flex; align-items:center; gap:12px; margin-bottom:28px; }
+    .header-icon { width:44px; height:44px; background:var(--green-glow); border:1px solid rgba(16,185,129,.25); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:22px; }
+    h1 { font-family:'IBM Plex Mono',monospace; font-size:24px; font-weight:700; color:var(--text); }
+    h1 span { color:var(--green); }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; margin:14px 0; }
+    .card-title { font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:1.5px; color:var(--green); margin-bottom:14px; }
+    label { display:block; font-weight:600; font-size:13px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; margin:12px 0 6px; }
+    input, select {
+      width:100%; padding:12px 14px; border-radius:8px; border:1px solid var(--border);
+      background:var(--surface2); color:var(--text); font-size:15px; font-family:'DM Sans',sans-serif;
+      transition:border-color .2s;
+    }
+    input:focus, select:focus { outline:none; border-color:var(--green); box-shadow:0 0 0 3px var(--green-glow); }
+    select option { background:var(--surface2); color:var(--text); }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .btn {
+      width:100%; font-size:15px; font-weight:600; padding:14px 18px; border-radius:8px; border:none;
+      background:var(--green); color:#fff; cursor:pointer; font-family:'DM Sans',sans-serif;
+      transition:background .2s, transform .1s; margin-top:16px; letter-spacing:.3px;
+    }
+    .btn:hover { background:var(--green-dim); }
+    .btn:active { transform:scale(.98); }
+    .note { color:var(--text-dim); font-size:12px; margin-top:10px; font-family:'IBM Plex Mono',monospace; }
+    code { background:var(--surface2); padding:2px 6px; border-radius:4px; font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--green); }
+    .footer { text-align:center; color:var(--text-dim); font-size:11px; font-family:'IBM Plex Mono',monospace; margin-top:32px; padding-top:16px; border-top:1px solid var(--border); }
+    .type-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:8px; margin-bottom:4px; }
+    .type-chip {
+      background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:10px 12px;
+      text-align:center; cursor:pointer; transition:all .2s; font-size:13px; font-weight:500;
+    }
+    .type-chip:hover { border-color:var(--green); background:rgba(16,185,129,.06); }
+    .type-chip.active { border-color:var(--green); background:var(--green-glow); color:var(--green); }
+    .type-chip .chip-icon { font-size:20px; display:block; margin-bottom:4px; }
+    .type-chip .chip-label { font-size:11px; color:var(--text-dim); }
+    .type-chip.active .chip-label { color:var(--green); }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Whatnot Lister v2</h1>
+    <div class="header">
+      <div class="header-icon">&#128722;</div>
+      <h1>Whatnot <span>Lister</span> v2</h1>
+    </div>
 
     <div class="card">
-      <h2>1) Confirm server path</h2>
-      <div class="note">Worker reads directly from: <code>${escapeHtml(baseClean)}</code></div>
+      <div class="card-title">Server Path</div>
+      <div class="note">Reading from: <code>${escapeHtml(baseClean)}</code></div>
       <div class="note">Example: <code>${escapeHtml(example)}</code></div>
     </div>
 
     <div class="card">
-      <h2>2) Build CSV</h2>
+      <div class="card-title">Build CSV</div>
       <form method="POST" action="/process">
+        <input type="hidden" name="folder" id="folderInput" value="vinyl_lp" />
+
+        <label>Item Type</label>
+        <div class="type-grid">
+          <div class="type-chip active" onclick="pickType(this,'vinyl_lp')"><span class="chip-icon">&#127926;</span>Vinyl LP<div class="chip-label">Music</div></div>
+          <div class="type-chip" onclick="pickType(this,'vinyl_45')"><span class="chip-icon">&#128191;</span>45 RPM<div class="chip-label">Music</div></div>
+          <div class="type-chip" onclick="pickType(this,'cd')"><span class="chip-icon">&#128191;</span>CD<div class="chip-label">Music</div></div>
+          <div class="type-chip" onclick="pickType(this,'cassette')"><span class="chip-icon">&#128252;</span>Cassette<div class="chip-label">Music</div></div>
+          <div class="type-chip" onclick="pickType(this,'books')"><span class="chip-icon">&#128214;</span>Books<div class="chip-label">4 pics min</div></div>
+          <div class="type-chip" onclick="pickType(this,'dvd')"><span class="chip-icon">&#127916;</span>DVD<div class="chip-label">4 pics min</div></div>
+          <div class="type-chip" onclick="pickType(this,'magazines')"><span class="chip-icon">&#128240;</span>Magazines<div class="chip-label">4 pics min</div></div>
+        </div>
+
         <div class="row">
           <div>
-            <label>Folder</label>
-            <select name="folder" required>
-              <option value="vinyl_lp">vinyl_lp (LP)</option>
-              <option value="vinyl_45">vinyl_45 (45)</option>
-              <option value="cd">cd</option>
-              <option value="cassette">cassette</option>
-              <option value="books">books (Books)</option>
-              <option value="dvd">dvd (DVD/Blu-ray)</option>
-            </select>
+            <label>Start ID</label>
+            <input name="startId" inputmode="numeric" placeholder="1" required />
           </div>
           <div>
-            <label>Start ID</label>
-            <input name="startId" inputmode="numeric" placeholder="5000" required />
+            <label>End ID</label>
+            <input name="endId" inputmode="numeric" placeholder="50" required />
           </div>
         </div>
 
-        <label>End ID</label>
-        <input name="endId" inputmode="numeric" placeholder="5004" required />
-
-        <div style="margin-top:12px;">
-          <button type="submit">Process Images &rarr; Download CSV</button>
-        </div>
-        <div class="note">Scans IDs and includes only ones where <code>_1.jpg</code> exists. Books &amp; DVDs require at least 2 images per item.</div>
+        <button type="submit" class="btn">Process Images &rarr; Download CSV</button>
+        <div class="note">Scans IDs and includes only items where images exist. Books, DVDs &amp; Magazines require at least 4 images per item.</div>
       </form>
     </div>
 
     <div class="card">
-      <h2>3) Debug single item</h2>
+      <div class="card-title">Debug</div>
       <div class="note">
         <code>GET /debug-one?folder=vinyl_lp&amp;id=5000</code> &mdash;
-        returns raw OpenAI response, resolved image URLs, parsed object, and final title/description.
+        returns raw AI response, image URLs, parsed data, and final title/description.
       </div>
     </div>
 
+    <div class="footer">Gooder Labs LLC &mdash; Whatnot Lister v2</div>
   </div>
+
+  <script>
+    function pickType(el, val) {
+      document.querySelectorAll('.type-chip').forEach(c => c.classList.remove('active'));
+      el.classList.add('active');
+      document.getElementById('folderInput').value = val;
+    }
+  </script>
 </body>
 </html>`;
 }
@@ -554,6 +638,23 @@ function buildSystemPrompt(hints) {
       `  "format": "DVD or Blu-ray or 4K UHD",`,
       `  "year": "string",`,
       `  "rating": "string",`,
+      `  "confidence": number`,
+      `}`,
+    ].join("\n");
+  }
+
+  if (folder === "magazines") {
+    return [
+      `You are identifying a magazine from photos for an auction listing.`,
+      `Return ONLY valid JSON (no markdown, no extra text).`,
+      `Rules:`,
+      `- Identify the magazine title and issue date (month/year or specific date if visible).`,
+      `- If unsure: use best guess and keep it short.`,
+      `- No emojis.`,
+      `Schema:`,
+      `{`,
+      `  "title": "string",`,
+      `  "issueDate": "string",`,
       `  "confidence": number`,
       `}`,
     ].join("\n");
@@ -770,6 +871,7 @@ async function callOpenAIForListing(env, images, hints) {
     format:        safeStr(parsed.format)         || "",
     year:          safeStr(parsed.year)           || "",
     rating:        safeStr(parsed.rating)         || "",
+    issueDate:     safeStr(parsed.issueDate)      || "",
     confidence:    typeof parsed.confidence === "number" ? parsed.confidence : undefined,
     warnings,
     _debug,
@@ -787,6 +889,7 @@ function fallbackResult(warnings, _debug) {
     format: "",
     year: "",
     rating: "",
+    issueDate: "",
     confidence: 0,
     warnings,
     _debug,
