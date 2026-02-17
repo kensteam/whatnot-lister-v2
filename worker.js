@@ -65,7 +65,7 @@ export default {
       const allWarnings = [...(ai.warnings || []), ...cfWarnings];
 
       // 3. Build final title/description — same logic as /process
-      const { title: finalTitle, description: finalDescription } = buildTitleDesc(ai, rule, id);
+      const { title: finalTitle, description: finalDescription } = buildTitleDesc(ai, rule, id, folder);
 
       return jsonResp({
         id,
@@ -91,11 +91,11 @@ export default {
       assertEnv(env);
 
       const form = await request.formData();
-      const folder = (form.get("folder") || "").toString().trim();
+      let folder = (form.get("folder") || "").toString().trim();
       const startId = Number((form.get("startId") || "").toString().trim());
       const endId = Number((form.get("endId") || "").toString().trim());
 
-      const allowedFolders = new Set(["vinyl_lp", "vinyl_45", "cd", "cassette"]);
+      const allowedFolders = new Set(["vinyl_lp", "vinyl_45", "cd", "cassette", "books", "dvd"]);
       if (!allowedFolders.has(folder)) return new Response("Bad folder.", { status: 400 });
       if (!Number.isFinite(startId) || !Number.isFinite(endId) || startId <= 0 || endId < startId) {
         return new Response("Bad ID range.", { status: 400 });
@@ -127,6 +127,14 @@ export default {
           continue;
         }
 
+        // Enforce minimum images for books/dvd
+        const minImages = rule.minImages || 1;
+        if (imageUrls.length < minImages) {
+          idDebug.missingVariants.push(`${id} — only ${imageUrls.length} image(s), need ${minImages}`);
+          if (debug) debugLogs.push(idDebug);
+          continue;
+        }
+
         // Apply optional CF Image Resizing for OpenAI
         const { urls: aiImageUrls, cfWarnings } = transformImageUrls(imageUrls, env);
 
@@ -142,11 +150,11 @@ export default {
         if (debug) debugLogs.push(idDebug);
 
         // Build final title/description with fallback
-        const { title, description } = buildTitleDesc(ai, rule, id);
+        const { title, description } = buildTitleDesc(ai, rule, id, folder);
 
         rows.push({
           Category: rule.category,
-          "Sub Category": rule.subcategory,
+          "Sub Category": folder === "dvd" ? resolveDvdSubCategory(ai) : rule.subcategory,
           Title: title,
           Description: description,
           Quantity: 1,
@@ -155,7 +163,7 @@ export default {
           "Shipping Profile": rule.shipping,
           Offerable: "TRUE",
           Hazmat: "Not Hazmat",
-          Condition: "",
+          Condition: rule.condition || "",
           "Cost Per Item": "",
           SKU: `${id}`,
           ...toImageCols(imageUrls),
@@ -201,6 +209,8 @@ function typeRules() {
     vinyl_45:  { category: "Music", subcategory: "Vinyl Records",   price: 3, shipping: "4-7 oz", label: "45 rpm vinyl record" },
     cd:        { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "CD" },
     cassette:  { category: "Music", subcategory: "CDs & Cassettes", price: 3, shipping: "4-7 oz", label: "Music cassette tape" },
+    books:     { category: "Books", subcategory: "New & Used Books", price: 5, shipping: "",      label: "Book",             condition: "Good", minImages: 2 },
+    dvd:       { category: "Movies & TV", subcategory: "DVD",       price: 3, shipping: "4-7 oz", label: "DVD or Blu-ray disc", condition: "Good", minImages: 2 },
   };
 }
 
@@ -208,7 +218,13 @@ function typeRules() {
 // Build title + description from AI result (shared logic, with fallback)
 // ──────────────────────────────────────────────────────────────────────────────
 
-function buildTitleDesc(ai, rule, id) {
+function buildTitleDesc(ai, rule, id, folder) {
+  if (folder === "books") return buildBookTitleDesc(ai, rule, id);
+  if (folder === "dvd") return buildDvdTitleDesc(ai, rule, id);
+  return buildVinylTitleDesc(ai, rule, id);
+}
+
+function buildVinylTitleDesc(ai, rule, id) {
   const artist = safeStr(ai.artist);
   const album  = safeStr(ai.album);
   const label  = safeStr(ai.label);
@@ -245,6 +261,78 @@ function buildTitleDesc(ai, rule, id) {
   const description = clampDesc(noEmoji(lines.join("\n")));
 
   return { title, description };
+}
+
+function buildBookTitleDesc(ai, rule, id) {
+  const author = safeStr(ai.author);
+  const bookTitle = safeStr(ai.title);
+  const format = safeStr(ai.format); // HC or PB
+
+  let title = "";
+  if (author && bookTitle) {
+    const parts = [author, bookTitle, format].filter(Boolean);
+    title = parts.join(" - ");
+    if (title.length > 50 && format) title = `${author} - ${bookTitle}`;
+    if (title.length > 50) title = bookTitle;
+  } else if (bookTitle) {
+    title = format ? `${bookTitle} - ${format}` : bookTitle;
+  } else {
+    title = `Book Lot ${id}`;
+  }
+  title = clamp50(noEmoji(title));
+
+  const lines = [];
+  if (author && bookTitle) {
+    lines.push(`${bookTitle} by ${author}.`);
+  } else if (bookTitle) {
+    lines.push(`${bookTitle}.`);
+  } else {
+    lines.push("Book (see photos).");
+  }
+  if (format) lines.push(`Format: ${format}.`);
+  lines.push("Condition: Good. See photos. Ships fast.");
+  const description = clampDesc(noEmoji(lines.join(" ")));
+
+  return { title, description };
+}
+
+function buildDvdTitleDesc(ai, rule, id) {
+  const dvdTitle = safeStr(ai.title);
+  const format = safeStr(ai.format); // DVD, Blu-ray, 4K UHD
+  const year = safeStr(ai.year);
+  const rating = safeStr(ai.rating);
+
+  let title = "";
+  if (dvdTitle) {
+    const parts = [dvdTitle, format, year, rating].filter(Boolean);
+    title = parts.join(" - ");
+    if (title.length > 50 && rating) title = [dvdTitle, format, year].filter(Boolean).join(" - ");
+    if (title.length > 50 && year) title = [dvdTitle, format].filter(Boolean).join(" - ");
+    if (title.length > 50) title = dvdTitle;
+  } else {
+    title = `DVD Lot ${id}`;
+  }
+  title = clamp50(noEmoji(title));
+
+  const lines = [];
+  if (dvdTitle) {
+    lines.push(`${dvdTitle} (${format || "DVD"}).`);
+  } else {
+    lines.push("DVD/Blu-ray disc (see photos).");
+  }
+  if (year) lines.push(`Year: ${year}.`);
+  if (rating) lines.push(`Rated: ${rating}.`);
+  lines.push("Condition: Good. See photos. Ships fast.");
+  const description = clampDesc(noEmoji(lines.join(" ")));
+
+  return { title, description };
+}
+
+function resolveDvdSubCategory(ai) {
+  const format = safeStr(ai.format).toLowerCase();
+  if (format.includes("blu")) return "Blu-ray";
+  if (format.includes("4k") || format.includes("uhd")) return "4K Ultra HD";
+  return "DVD";
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -296,6 +384,8 @@ function htmlPage(env) {
               <option value="vinyl_45">vinyl_45 (45)</option>
               <option value="cd">cd</option>
               <option value="cassette">cassette</option>
+              <option value="books">books (Books)</option>
+              <option value="dvd">dvd (DVD/Blu-ray)</option>
             </select>
           </div>
           <div>
@@ -310,7 +400,7 @@ function htmlPage(env) {
         <div style="margin-top:12px;">
           <button type="submit">Process Images &rarr; Download CSV</button>
         </div>
-        <div class="note">Scans IDs and includes only ones where <code>_1.jpg</code> exists.</div>
+        <div class="note">Scans IDs and includes only ones where <code>_1.jpg</code> exists. Books &amp; DVDs require at least 2 images per item.</div>
       </form>
     </div>
 
@@ -426,6 +516,70 @@ function transformImageUrls(urls, env) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// System prompts per folder type
+// ──────────────────────────────────────────────────────────────────────────────
+
+function buildSystemPrompt(hints) {
+  const { folder, label } = hints;
+
+  if (folder === "books") {
+    return [
+      `You are identifying a book from photos for an auction listing.`,
+      `Return ONLY valid JSON (no markdown, no extra text).`,
+      `Rules:`,
+      `- Identify the author, title, and format (HC for hardcover, PB for paperback).`,
+      `- If unsure: use best guess and keep it short.`,
+      `- No emojis.`,
+      `Schema:`,
+      `{`,
+      `  "author": "string",`,
+      `  "title": "string",`,
+      `  "format": "HC or PB",`,
+      `  "confidence": number`,
+      `}`,
+    ].join("\n");
+  }
+
+  if (folder === "dvd") {
+    return [
+      `You are identifying a DVD or Blu-ray disc from photos for an auction listing.`,
+      `Return ONLY valid JSON (no markdown, no extra text).`,
+      `Rules:`,
+      `- Identify the title, format (DVD, Blu-ray, or 4K UHD), year, and rating if visible.`,
+      `- If unsure: use best guess and keep it short.`,
+      `- No emojis.`,
+      `Schema:`,
+      `{`,
+      `  "title": "string",`,
+      `  "format": "DVD or Blu-ray or 4K UHD",`,
+      `  "year": "string",`,
+      `  "rating": "string",`,
+      `  "confidence": number`,
+      `}`,
+    ].join("\n");
+  }
+
+  // Default: vinyl/cd/cassette
+  return [
+    `You are identifying an ${label} from photos for an auction listing.`,
+    `Return ONLY valid JSON (no markdown, no extra text).`,
+    `Rules:`,
+    `- If Artist + Album visible: identify both.`,
+    `- If unsure: use best guess and keep it short.`,
+    `- No emojis.`,
+    `- Keep everything concise and auction-ready.`,
+    `Schema:`,
+    `{`,
+    `  "artist": "string",`,
+    `  "album": "string",`,
+    `  "label": "string",`,
+    `  "catalogNumber": "string",`,
+    `  "confidence": number`,
+    `}`,
+  ].join("\n");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // callOpenAIForListing — THE core AI function, used by both /process & /debug-one
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -450,23 +604,7 @@ async function callOpenAIForListing(env, images, hints) {
     requestBodyPreview: null, model_used: null, model_attempts: [],
   };
 
-  const systemPrompt = [
-    `You are identifying an ${hints.label} from photos for an auction listing.`,
-    `Return ONLY valid JSON (no markdown, no extra text).`,
-    `Rules:`,
-    `- If Artist + Album visible: identify both.`,
-    `- If unsure: use best guess and keep it short.`,
-    `- No emojis.`,
-    `- Keep everything concise and auction-ready.`,
-    `Schema:`,
-    `{`,
-    `  "artist": "string",`,
-    `  "album": "string",`,
-    `  "label": "string",`,
-    `  "catalogNumber": "string",`,
-    `  "confidence": number`,
-    `}`,
-  ].join("\n");
+  const systemPrompt = buildSystemPrompt(hints);
 
   // ── Build Responses API input payload (model inserted per attempt) ──
   // image_url is a bare string (confirmed working with /v1/responses)
@@ -627,6 +765,11 @@ async function callOpenAIForListing(env, images, hints) {
     album:         safeStr(parsed.album)          || "",
     label:         safeStr(parsed.label)          || "",
     catalogNumber: safeStr(parsed.catalogNumber)  || "",
+    author:        safeStr(parsed.author)         || "",
+    title:         safeStr(parsed.title)          || "",
+    format:        safeStr(parsed.format)         || "",
+    year:          safeStr(parsed.year)           || "",
+    rating:        safeStr(parsed.rating)         || "",
     confidence:    typeof parsed.confidence === "number" ? parsed.confidence : undefined,
     warnings,
     _debug,
@@ -639,6 +782,11 @@ function fallbackResult(warnings, _debug) {
     album: "",
     label: "",
     catalogNumber: "",
+    author: "",
+    title: "",
+    format: "",
+    year: "",
+    rating: "",
     confidence: 0,
     warnings,
     _debug,
