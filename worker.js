@@ -94,6 +94,7 @@ export default {
       let folder = (form.get("folder") || "").toString().trim();
       const startId = Number((form.get("startId") || "").toString().trim());
       const endId = Number((form.get("endId") || "").toString().trim());
+      const platform = (form.get("platform") || "whatnot").toString().trim().toLowerCase();
 
       const allowedFolders = new Set(["vinyl_lp", "vinyl_45", "cd", "cassette", "books", "dvd", "magazines"]);
       if (!allowedFolders.has(folder)) return new Response("Bad folder.", { status: 400 });
@@ -172,18 +173,63 @@ export default {
 
       // DEBUG → JSON
       if (debug) {
-        return jsonResp({ rowCount: rows.length, debugLogs, rows });
+        return jsonResp({ rowCount: rows.length, debugLogs, rows, platform });
       }
 
-      // Normal → CSV
-      const csvHeaders = [
-        "Category", "Sub Category", "Title", "Description", "Quantity", "Type", "Price", "Shipping Profile",
-        "Offerable", "Hazmat", "Condition", "Cost Per Item", "SKU",
-        "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4", "Image URL 5", "Image URL 6", "Image URL 7", "Image URL 8",
-      ];
-      const csv = toCsv(csvHeaders, rows);
+      // ── Build CSV based on platform ──
+      let csv, csvFilename;
 
-      const csvFilename = `whatnot_upload_${Date.now()}.csv`;
+      if (platform === "hibid") {
+        // HiBid lots CSV
+        const hibidRows = rows.map((r, idx) => ({
+          "Lot Number":                       idx + 1,
+          "Sale Order":                       idx + 1,
+          "Title":                            r.Title,
+          "Description":                      r.Description,
+          "Linked Group":                     "",
+          "Quantity":                          1,
+          "Presale Estimate Min Each":         "",
+          "Presale Estimate Max Each":         "",
+          "Reserve Each":                      "",
+          "Start Bid Each":                    r.Price,
+          "Seller Code":                       "",
+          "Commission Code":                   "",
+          "Seller Tax Formula Code":           "",
+          "Buyer Premium Formula Code":        "",
+          "Buyer Tax Formula Code":            "",
+          "Buyer Lot Charge 1 Formula Code":   "",
+          "Buyer Lot Charge 2 Formula Code":   "",
+          "Clerk Status":                      "",
+          "Hammer Price":                      "",
+          "Bidder Number":                     "",
+          "Quantity Sold":                     "",
+          "Hibid Shipping Availability":       "Shipping Available",
+          "Image URL":                         r["Image URL 1"] || "",
+          "Lot Link URLs":                     "",
+          "Lot Link Description":              "",
+        }));
+
+        const hibidHeaders = [
+          "Lot Number", "Sale Order", "Title", "Description", "Linked Group", "Quantity",
+          "Presale Estimate Min Each", "Presale Estimate Max Each", "Reserve Each", "Start Bid Each",
+          "Seller Code", "Commission Code", "Seller Tax Formula Code", "Buyer Premium Formula Code",
+          "Buyer Tax Formula Code", "Buyer Lot Charge 1 Formula Code", "Buyer Lot Charge 2 Formula Code",
+          "Clerk Status", "Hammer Price", "Bidder Number", "Quantity Sold",
+          "Hibid Shipping Availability", "Image URL", "Lot Link URLs", "Lot Link Description",
+        ];
+
+        csv = toCsv(hibidHeaders, hibidRows);
+        csvFilename = `hibid_lots_${Date.now()}.csv`;
+      } else {
+        // Whatnot CSV (original format)
+        const csvHeaders = [
+          "Category", "Sub Category", "Title", "Description", "Quantity", "Type", "Price", "Shipping Profile",
+          "Offerable", "Hazmat", "Condition", "Cost Per Item", "SKU",
+          "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4", "Image URL 5", "Image URL 6", "Image URL 7", "Image URL 8",
+        ];
+        csv = toCsv(csvHeaders, rows);
+        csvFilename = `whatnot_upload_${Date.now()}.csv`;
+      }
 
       return new Response(csv, {
         headers: {
@@ -379,7 +425,7 @@ function htmlPage(env) {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Whatnot Lister v2</title>
+  <title>Auction Lister</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -438,7 +484,7 @@ function htmlPage(env) {
   <div class="wrap">
     <div class="header">
       <div class="header-icon">&#128722;</div>
-      <h1>Whatnot <span>Lister</span> v2</h1>
+      <h1>Auction <span>Lister</span></h1>
     </div>
 
     <div class="card">
@@ -476,6 +522,13 @@ function htmlPage(env) {
 
         <button type="submit" class="btn">Process Images &rarr; Download CSV</button>
         <div class="note">Scans IDs and includes only items where images exist. Books, DVDs &amp; Magazines require at least 4 images per item.</div>
+
+        <label style="margin-top:18px;">Platform</label>
+        <div class="type-grid" style="grid-template-columns:1fr 1fr;">
+          <div class="type-chip platform-chip active" onclick="pickPlatform(this,'whatnot')"><span class="chip-icon">&#127918;</span>Whatnot<div class="chip-label">Auction CSV</div></div>
+          <div class="type-chip platform-chip" onclick="pickPlatform(this,'hibid')"><span class="chip-icon">&#128296;</span>HiBid<div class="chip-label">Lots CSV</div></div>
+        </div>
+        <input type="hidden" name="platform" id="platformInput" value="whatnot" />
       </form>
     </div>
 
@@ -487,14 +540,19 @@ function htmlPage(env) {
       </div>
     </div>
 
-    <div class="footer">Gooder Labs LLC &mdash; Whatnot Lister v2</div>
+    <div class="footer">Gooder Labs LLC &mdash; Auction Lister</div>
   </div>
 
   <script>
     function pickType(el, val) {
-      document.querySelectorAll('.type-chip').forEach(c => c.classList.remove('active'));
+      document.querySelectorAll('.type-chip:not(.platform-chip)').forEach(c => c.classList.remove('active'));
       el.classList.add('active');
       document.getElementById('folderInput').value = val;
+    }
+    function pickPlatform(el, val) {
+      document.querySelectorAll('.platform-chip').forEach(c => c.classList.remove('active'));
+      el.classList.add('active');
+      document.getElementById('platformInput').value = val;
     }
   </script>
 </body>

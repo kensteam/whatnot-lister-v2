@@ -1,4 +1,4 @@
-name = "whatnot-lister-v2"
+name = "auction-lister"
 main = "worker.js"
 compatibility_date = "2025-02-01"
 
